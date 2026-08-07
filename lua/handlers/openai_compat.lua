@@ -468,7 +468,17 @@ local function analyze_error_for_retry(status, res, err)
         r.cooldown_provider_model = false
         r.skip_same_provider = false
       end
-      if retry_after then
+
+      -- 区分配额耗尽（半永久，长冷却）与普通限流（瞬时，短冷却）
+      -- 配额耗尽：insufficient_quota / allocated quota exceeded / quota limit
+      -- 这种状态不会在几分钟内恢复，需要长冷却避免反复撞墙
+      local is_quota_exhausted = signal:find('insufficient_quota', 1, true)
+        or signal:find('quota exceeded', 1, true)
+        or signal:find('allocated quota', 1, true)
+
+      if is_quota_exhausted then
+        r.key_cooldown_sec = runtime.key_quota_cooldown_sec
+      elseif retry_after then
         r.key_cooldown_sec = math.max(retry_after, runtime.key_rate_limit_cooldown_sec)
       end
     end

@@ -24,6 +24,7 @@ services:
       - ./lua/init.lua:/app/lua/init.lua:ro
       - ./lua/config/yaml.lua:/app/lua/config/yaml.lua:ro
       - ./lua/config/loader.lua:/app/lua/config/loader.lua:ro
+      - ./lua/config/runtime.lua:/app/lua/config/runtime.lua:ro
       - ./lua/core/auth.lua:/app/lua/core/auth.lua:ro
       - ./lua/core/http_client.lua:/app/lua/core/http_client.lua:ro
       - ./lua/core/observe.lua:/app/lua/core/observe.lua:ro
