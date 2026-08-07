@@ -79,3 +79,27 @@ providers:
       #   value_env: "GEMINI_API_KEY"
     weight: 3
     timeout_ms: 60000
+
+  anthropic:
+    # Anthropic 原生 Messages API（type=anthropic）
+    # 网关会自动把 OpenAI Chat Completions 请求转换为 Anthropic Messages 请求，
+    # 并把 Anthropic 响应（含流式 SSE）转回 OpenAI 格式，客户端无需任何改动。
+    type: anthropic
+    base_url: "https://api.anthropic.com"
+    endpoints:
+      chat_completions: "/v1/messages"
+    # Anthropic 不使用 Authorization Bearer，而是 x-api-key + anthropic-version
+    # auth 段可省略，网关会自动注入这两个头部
+    # 可选：覆盖默认 anthropic-version（默认 2023-06-01）
+    # anthropic_version: "2023-06-01"
+    keys:
+      - id: "anthropic-key-1"
+        value: "sk-ant-your-anthropic-api-key"
+      # - id: "anthropic-key-2"
+      #   value_env: "ANTHROPIC_API_KEY"
+    weight: 4
+    timeout_ms: 60000
+    ssl_verify: true
+    # 可选：为该 provider 的所有请求注入默认参数（不会覆盖客户端显式传入的值）
+    # request_defaults:
+    #   max_tokens: 2048

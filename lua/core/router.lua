@@ -25,6 +25,11 @@ local function allow_provider(model_policy, provider_name)
   return model_policy.allow_set[provider_name] == true
 end
 
+-- 检查 (provider_name, provider_model) 组合是否未被冷却
+local function provider_model_ready(provider_name, provider_model)
+  return keypool.is_provider_model_available(provider_name, provider_model)
+end
+
 local function get_model(config, std_model)
   if not config or not std_model then
     return nil, 'invalid arguments'
@@ -59,7 +64,7 @@ function _M.select_provider_with_key(config, std_model, opts)
   if prefer and not exclude[prefer] and allow_provider(model.policy, prefer) then
     local provider = config.providers[prefer]
     local provider_model = model.provider_map[prefer]
-    if provider and provider_model then
+    if provider and provider_model and provider_model_ready(prefer, provider_model) then
       local key = keypool.pick_key(provider, {
         exclude_key_ids = opts and opts.exclude_key_ids_by_provider and opts.exclude_key_ids_by_provider[provider.name] or nil
       })
@@ -76,7 +81,7 @@ function _M.select_provider_with_key(config, std_model, opts)
       if not exclude[default_name] and allow_provider(model.policy, default_name) then
         local provider = config.providers[default_name]
         local provider_model = model.provider_map[default_name]
-        if provider and provider_model then
+        if provider and provider_model and provider_model_ready(default_name, provider_model) then
           table.insert(chain_items, { provider = provider, model = provider_model })
         end
       end
@@ -94,7 +99,10 @@ function _M.select_provider_with_key(config, std_model, opts)
   local total = 0
 
   for provider_name, provider_model in pairs(model.provider_map or {}) do
-    if not exclude[provider_name] and allow_provider(model.policy, provider_name) then
+    if not exclude[provider_name]
+      and allow_provider(model.policy, provider_name)
+      and provider_model_ready(provider_name, provider_model)
+    then
       local provider = config.providers[provider_name]
       if provider and keypool.has_available_key(provider) then
         local weight = tonumber(provider.weight) or 1
@@ -104,6 +112,24 @@ function _M.select_provider_with_key(config, std_model, opts)
           model = provider_model,
         })
         total = total + weight
+      end
+    end
+  end
+
+  if #candidates == 0 then
+    -- 兜底：如果所有候选都因为 provider-model 冷却被排除，放宽限制（避免无 provider 可用）
+    for provider_name, provider_model in pairs(model.provider_map or {}) do
+      if not exclude[provider_name] and allow_provider(model.policy, provider_name) then
+        local provider = config.providers[provider_name]
+        if provider and keypool.has_available_key(provider) then
+          local weight = tonumber(provider.weight) or 1
+          table.insert(candidates, {
+            name = provider_name,
+            weight = weight,
+            model = provider_model,
+          })
+          total = total + weight
+        end
       end
     end
   end

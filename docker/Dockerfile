@@ -1,4 +1,4 @@
-FROM openresty/openresty:alpine
+FROM docker.m.daocloud.io/openresty/openresty:alpine
 
 # 安装必要的工具：logrotate（日志轮转）和 cronie（定时任务）
 RUN apk add --no-cache ca-certificates logrotate dcron

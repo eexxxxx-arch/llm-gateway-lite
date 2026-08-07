@@ -32,6 +32,7 @@ services:
       - ./lua/core/stats.lua:/app/lua/core/stats.lua:ro
       - ./lua/core/admin_auth.lua:/app/lua/core/admin_auth.lua:ro
       - ./lua/core/config_manager.lua:/app/lua/core/config_manager.lua:ro
+      - ./lua/core/gemini_signature.lua:/app/lua/core/gemini_signature.lua:ro
       - ./lua/handlers/openai_compat.lua:/app/lua/handlers/openai_compat.lua:ro
       - ./lua/handlers/models.lua:/app/lua/handlers/models.lua:ro
       - ./lua/handlers/log.lua:/app/lua/handlers/log.lua:ro

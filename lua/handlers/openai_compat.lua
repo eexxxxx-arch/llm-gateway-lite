@@ -8,6 +8,8 @@ local errors = require('core.errors')
 local observe = require('core.observe')
 local http_client = require('core.http_client')
 local auth = require('core.auth')
+local anthropic = require('core.anthropic_adapter')
+local gemini_sig = require('core.gemini_signature')
 
 local _M = {}
 
@@ -26,36 +28,62 @@ local function format_timestamp()
   return os.date('%Y-%m-%d %H:%M:%S', sec) .. string.format('.%03d', msec)
 end
 
+-- 脱敏敏感请求头（如 Authorization），返回浅拷贝避免污染原始表
+local function sanitize_headers(headers)
+  if type(headers) ~= 'table' then
+    return headers
+  end
+  local sanitized = {}
+  for k, v in pairs(headers) do
+    if type(k) == 'string' and k:lower() == 'authorization' then
+      sanitized[k] = '***'
+    else
+      sanitized[k] = v
+    end
+  end
+  return sanitized
+end
+
+-- 截断过长的请求体，避免 error.log 单行被撑爆导致 response/error 被截掉
+-- 完整 body 已由 log_upstream_request 写入 upstream.log，error.log 只保留头部用于上下文
+local function truncate_body(body, max_len)
+  max_len = max_len or 2048
+  if type(body) ~= 'string' or #body <= max_len then
+    return body
+  end
+  return body:sub(1, max_len) .. '...[truncated, total ' .. #body .. ' bytes]'
+end
+
 local function log_failed_request(provider, url, headers, request_body, res, req_err)
+  -- response / error 放在 request 之前，且 request.body 做截断，
+  -- 确保上游真正的报错不会被超长 body 挤出 error.log 的单行上限
   local log_entry = {
     timestamp = format_timestamp(),
     level = 'ERROR',
     event = 'upstream_request_failed',
-    
-    -- 请求信息
-    request = {
-      url = url,
-      method = 'POST',
-      headers = headers,  -- 完整请求头
-      body = request_body,  -- 完整请求体
-    },
-    
-    -- 响应信息
+    provider = provider.name,
+    request_id = ngx.ctx.request_id,
+    key_id = headers and headers['Authorization'] and '***' or nil,
+
+    -- 响应信息（优先输出，便于排查上游真实报错）
     response = {
       status = res and res.status or nil,
       headers = res and res.headers or nil,
-      body = res and res.body or nil,  -- 完整响应体
+      body = res and res.body or nil,
     },
-    
+
     -- 错误信息
     error = req_err,
-    
-    -- 上下文
-    provider = provider.name,
-    key_id = headers and headers['Authorization'] and '***' or nil,  -- 脱敏
-    request_id = ngx.ctx.request_id,
+
+    -- 请求信息（headers 脱敏；body 截断，完整 body 见 upstream.log）
+    request = {
+      url = url,
+      method = 'POST',
+      headers = sanitize_headers(headers),
+      body = truncate_body(request_body),
+    },
   }
-  
+
   ngx.log(ngx.ERR, '[', format_timestamp(), '] ', cjson.encode(log_entry))
 end
 
@@ -69,7 +97,7 @@ local function log_upstream_request(provider, url, headers, request_body)
     request = {
       url = url,
       method = 'POST',
-      headers = headers,
+      headers = sanitize_headers(headers),
       body = request_body,
     },
   }
@@ -135,10 +163,6 @@ local function join_url(base, path)
 end
 
 local function build_headers(provider, key, request_id)
-  local auth = provider.auth or {}
-  local header_name = auth.header or 'Authorization'
-  local prefix = auth.prefix or ''
-
   local headers = {
     ['Content-Type'] = 'application/json',
     ['Accept'] = 'application/json',
@@ -148,7 +172,18 @@ local function build_headers(provider, key, request_id)
     ['Host'] = provider.host_header,
   }
 
-  headers[header_name] = prefix .. (key.value or '')
+  if anthropic.is_anthropic(provider) then
+    -- Anthropic Messages API 使用 x-api-key + anthropic-version 头部
+    local auth_headers = anthropic.build_auth_headers(provider, key)
+    for name, value in pairs(auth_headers) do
+      headers[name] = value
+    end
+  else
+    local auth = provider.auth or {}
+    local header_name = auth.header or 'Authorization'
+    local prefix = auth.prefix or ''
+    headers[header_name] = prefix .. (key.value or '')
+  end
 
   if provider.headers then
     for name, value in pairs(provider.headers) do
@@ -157,6 +192,19 @@ local function build_headers(provider, key, request_id)
   end
 
   return headers
+end
+
+-- 根据 provider 类型把 OpenAI 请求体编码为上游需要的 JSON 字符串
+local function encode_body_for_provider(body, provider)
+  if anthropic.is_anthropic(provider) then
+    local translated = anthropic.translate_request(body, provider)
+    local encoded, err = cjson.encode(translated)
+    if not encoded then
+      return nil, err or 'failed to encode anthropic body'
+    end
+    return encoded
+  end
+  return rewrite.encode_body(body)
 end
 
 local function copy_response_headers(headers)
@@ -269,6 +317,13 @@ local function extract_error_signal(res)
     push(decoded.error.type)
     push(decoded.error.message)
     push(decoded.error.param)
+    if type(decoded.error.metadata) == 'table' then
+      push(decoded.error.metadata.raw)
+      push(decoded.error.metadata.limit_source)
+      push(decoded.error.metadata.provider_error_code)
+      push(decoded.error.metadata.remedy_hint)
+      push(decoded.error.metadata.provider_name)
+    end
   elseif type(decoded.error) == 'string' then
     push(decoded.error)
   end
@@ -277,7 +332,195 @@ local function extract_error_signal(res)
     push(decoded.detail)
   end
 
+  -- 兼容一些 provider 把 metadata 放顶层
+  if type(decoded.metadata) == 'table' then
+    push(decoded.metadata.limit_source)
+    push(decoded.metadata.raw)
+  end
+
   return table.concat(parts, ' ')
+end
+
+-- 从响应体中提取 openrouter 风格的结构化 metadata，用于更精细的决策
+local function extract_error_metadata(res)
+  local out = {
+    limit_source = nil,      -- 'upstream_provider_shared_pool' | 'user' | 'provider' | nil
+    is_byok = nil,           -- 是否带自有 key
+    provider_error_code = nil,
+    provider_name = nil,
+    remedy_hint = nil,
+    raw = nil,
+  }
+  if not res or type(res.body) ~= 'string' or res.body == '' then
+    return out
+  end
+  local decoded = cjson.decode(res.body)
+  if type(decoded) ~= 'table' then
+    return out
+  end
+  local md = nil
+  if type(decoded.error) == 'table' and type(decoded.error.metadata) == 'table' then
+    md = decoded.error.metadata
+  elseif type(decoded.metadata) == 'table' then
+    md = decoded.metadata
+  end
+  if type(md) == 'table' then
+    out.limit_source = type(md.limit_source) == 'string' and md.limit_source or nil
+    out.is_byok = md.is_byok
+    out.provider_error_code = type(md.provider_error_code) == 'string' and md.provider_error_code or nil
+    out.provider_name = type(md.provider_name) == 'string' and md.provider_name or nil
+    out.remedy_hint = type(md.remedy_hint) == 'string' and md.remedy_hint or nil
+    out.raw = type(md.raw) == 'string' and md.raw or nil
+  end
+  return out
+end
+
+-- 从响应头中解析 Retry-After，返回秒数（nil 表示没有或无效）
+local function extract_retry_after_sec(headers)
+  if not runtime.respect_retry_after then
+    return nil
+  end
+  if type(headers) ~= 'table' then
+    return nil
+  end
+  local candidates = {
+    headers['retry-after'],
+    headers['Retry-After'],
+    headers['x-ratelimit-reset'],
+    headers['X-RateLimit-Reset'],
+  }
+  for _, v in ipairs(candidates) do
+    if type(v) == 'string' and v ~= '' then
+      local n = tonumber(v)
+      if n and n > 0 and n < 86400 then
+        return math.min(n, 3600) -- 上限 1 小时
+      end
+    end
+  end
+  return nil
+end
+
+-- 对 4xx/5xx 响应做结构化分析，返回给重试循环决策
+-- 返回: {
+--   cooldown_key: bool,              -- 是否需要冷却当前 key
+--   cooldown_provider_model: bool,   -- 是否需要冷却 (provider,model)（共享池限流场景）
+--   skip_same_provider: bool,        -- 是否跳过当前 provider 的其他 key（直接换 provider）
+--   key_cooldown_sec: number|nil,    -- key 冷却秒数建议（nil = 使用 runtime 默认）
+--   pm_cooldown_sec: number|nil,     -- provider-model 冷却秒数建议
+-- }
+local function analyze_error_for_retry(status, res, err)
+  local default = {
+    cooldown_key = false,
+    cooldown_provider_model = false,
+    skip_same_provider = false,
+    key_cooldown_sec = nil,
+    pm_cooldown_sec = nil,
+  }
+  if err then
+    -- 连接/超时/网络错误：不冷却 key，仅走重试逻辑
+    return default
+  end
+  if not status then
+    return default
+  end
+
+  if status == 401 or status == 402 or status == 403 then
+    -- 鉴权 / 余额：强烈冷却 key，不涉及 provider-model
+    local r = { cooldown_key = true, cooldown_provider_model = false, skip_same_provider = false }
+    r.key_cooldown_sec = runtime.key_cooldown_sec
+    return r
+  end
+
+  if status == 429 then
+    local md = extract_error_metadata(res)
+    local headers = res and res.headers or nil
+    local retry_after = extract_retry_after_sec(headers)
+
+    local r = {
+      cooldown_key = true,
+      cooldown_provider_model = false,
+      skip_same_provider = false,
+      key_cooldown_sec = runtime.key_rate_limit_cooldown_sec,
+      pm_cooldown_sec = retry_after or runtime.provider_model_cooldown_sec,
+    }
+
+    -- 识别共享池限流：openrouter 特有 limit_source == upstream_provider_shared_pool
+    -- 或 error message 中包含 "shared pool" / "rate-limited upstream" 等
+    local signal = extract_error_signal(res)
+    local is_shared_pool = (md.limit_source == 'upstream_provider_shared_pool')
+      or (md.limit_source and md.limit_source:find('shared', 1, true))
+      or (signal:find('shared pool', 1, true))
+      or (signal:find('upstream_provider_shared_pool', 1, true))
+      or (signal:find('rate%-limited upstream', 1, true))
+      or (signal:find('temporarily rate%-limited', 1, true))
+
+    if is_shared_pool then
+      -- 共享池限流：换 key 没用，换 provider 才有用
+      r.cooldown_provider_model = true
+      r.skip_same_provider = true
+      r.cooldown_key = false -- key 本身没问题，避免把 provider 的所有 key 都打冷却
+      if retry_after then
+        r.pm_cooldown_sec = math.max(retry_after, runtime.provider_model_cooldown_sec)
+      end
+    else
+      -- 未命中共享池特征时：如果是 BYOK（用户自有 key），更倾向于只冷却 key 并等待
+      if md.is_byok == true then
+        r.cooldown_provider_model = false
+        r.skip_same_provider = false
+      end
+      if retry_after then
+        r.key_cooldown_sec = math.max(retry_after, runtime.key_rate_limit_cooldown_sec)
+      end
+    end
+    return r
+  end
+
+  if status >= 500 and status <= 599 then
+    -- 5xx：一般不做 provider-model 级冷却，默认短 key 冷却或不冷却
+    local r = { cooldown_key = false, cooldown_provider_model = false, skip_same_provider = false }
+    local retry_after = extract_retry_after_sec(res and res.headers or nil)
+    if retry_after and retry_after > 5 then
+      r.cooldown_provider_model = true
+      r.pm_cooldown_sec = retry_after
+    end
+    return r
+  end
+
+  -- 400 + 错误信号命中模式的：按 should_cooldown_key 的语义（由上层调用者判断）
+  if status == 400 then
+    if should_cooldown_key(status, res, nil) then
+      return {
+        cooldown_key = true,
+        cooldown_provider_model = false,
+        skip_same_provider = false,
+        key_cooldown_sec = runtime.key_cooldown_sec,
+      }
+    end
+  end
+
+  return default
+end
+
+-- 指数退避 + jitter 睡眠（毫秒）。返回 true=睡过了，false=环境不支持睡眠
+local function retry_backoff_sleep(attempt)
+  local base = runtime.retry_backoff_base_ms
+  if not base or base <= 0 then
+    return false
+  end
+  -- attempt: 第几次重试（从 1 开始，说明已经失败过 1 次）
+  local cap = 2000 -- 最大 2s
+  local step = math.min(cap, base * math.pow(2, math.max(0, attempt - 1)))
+  -- full jitter: 0 ~ step 之间均匀随机，避免惊群
+  local ms = step * (math.random() or 0.5)
+  if ms < 1 then
+    return false
+  end
+  if ngx.sleep then
+    -- OpenResty 的 ngx.sleep 支持亚毫秒（传秒的小数）
+    ngx.sleep(ms / 1000.0)
+    return true
+  end
+  return false
 end
 
 local function should_cooldown_key(status, res, err)
@@ -360,13 +603,19 @@ local function do_request(provider, key, endpoint, body_json, request_id)
     body = body_json,
     timeout_ms = provider.timeout_ms,
     ssl_verify = provider.ssl_verify,
+    proxy_url = provider.proxy_url,
   })
 end
 
-local function relay_stream_response(stream_res)
+local function relay_stream_response(stream_res, provider)
   if not stream_res then
     return nil, 'missing stream response'
   end
+
+  -- Gemini 流式响应中捕获 thought_signature：解析 SSE data 行，按 tool_call.id 缓存
+  local do_capture = gemini_sig.is_gemini_provider(provider)
+  local sig_state = do_capture and gemini_sig.new_stream_state() or nil
+  local line_buffer = ''
 
   while true do
     local chunk, chunk_err = stream_res.read_chunk()
@@ -376,6 +625,25 @@ local function relay_stream_response(stream_res)
     if not chunk then
       return true
     end
+
+    -- 捕获签名：解析完整的 SSE data 行（不修改原始 chunk，仅读取）
+    if do_capture then
+      line_buffer = line_buffer .. chunk
+      while true do
+        local s, e = line_buffer:find('\r?\n', 1)
+        if not s then break end
+        local line = line_buffer:sub(1, s - 1)
+        line_buffer = line_buffer:sub(e + 1)
+        local data_str = line:match('^data:%s*(.+)$')
+        if data_str and data_str ~= '[DONE]' then
+          local decoded = cjson.decode(data_str)
+          if type(decoded) == 'table' then
+            gemini_sig.capture_from_sse_data(sig_state, decoded)
+          end
+        end
+      end
+    end
+
     local ok, print_err = ngx.print(chunk)
     if not ok then
       return nil, print_err or 'failed to write chunk'
@@ -387,11 +655,119 @@ local function relay_stream_response(stream_res)
   end
 end
 
-local function pick_retry_target(cfg, std_model, endpoint_key, current_provider, current_model, attempted_keys_by_provider, exhausted_providers)
-  local current_attempts = attempted_keys_by_provider[current_provider.name] or {}
-  local retry_key = keypool.pick_key(current_provider, { exclude_key_ids = current_attempts })
-  if retry_key then
-    return current_provider, current_model, retry_key
+-- 解析 Anthropic SSE 流并转写成 OpenAI Chat Completion 的 SSE chunk。
+-- 输入是 stream_res（http_client.request_stream 的返回值），输出通过 ngx.print/ngx.flush 发送。
+local function relay_anthropic_stream(stream_res, provider_model, request_id)
+  if not stream_res then
+    return nil, 'missing stream response'
+  end
+
+  local translator = anthropic.new_stream_translator(provider_model, request_id)
+  local buffer = ''
+  -- 累积待发送的字符串
+  local pending = {}
+
+  local function flush_pending()
+    if #pending == 0 then
+      return true
+    end
+    local data = table.concat(pending)
+    pending = {}
+    local ok, print_err = ngx.print(data)
+    if not ok then
+      return nil, print_err or 'failed to write anthropic stream'
+    end
+    local ok_flush, flush_err = ngx.flush(true)
+    if not ok_flush then
+      return nil, flush_err or 'failed to flush anthropic stream'
+    end
+    return true
+  end
+
+  local function emit(payload)
+    if payload and payload ~= '' then
+      table.insert(pending, 'data: ' .. payload .. '\n\n')
+    end
+  end
+
+  local function handle_event(event_type, data_str)
+    local data = cjson.decode(data_str) or {}
+    if event_type == 'error' then
+      -- Anthropic 流中错误事件：记录日志，让流自然结束
+      ngx.log(ngx.WARN, '[', format_timestamp(), '] [openai_compat] anthropic stream error event: ', data_str or '')
+      return
+    end
+    emit(translator.handle_event(event_type, data))
+  end
+
+  -- 处理 buffer 中已完整的事件块（以空行分隔）
+  local function process_buffer()
+    while true do
+      local start_idx, end_idx = buffer:find('\r?\n\r?\n', 1)
+      if not start_idx then
+        break
+      end
+      local block = buffer:sub(1, start_idx - 1)
+      buffer = buffer:sub(end_idx + 1)
+
+      local event_type = nil
+      local data_lines = {}
+      for line in block:gmatch('[^\r\n]+') do
+        local prefix, rest = line:match('^(%a+):%s*(.*)$')
+        if prefix == 'event' then
+          event_type = rest
+        elseif prefix == 'data' then
+          table.insert(data_lines, rest)
+        end
+      end
+      if event_type and #data_lines > 0 then
+        handle_event(event_type, table.concat(data_lines, '\n'))
+      end
+    end
+  end
+
+  while true do
+    local chunk, chunk_err = stream_res.read_chunk()
+    if chunk_err then
+      return nil, chunk_err
+    end
+    if not chunk then
+      -- 流结束，处理剩余 buffer
+      if buffer ~= '' then
+        -- 尝试补一个空行让 process_buffer 能处理最后一块
+        if not buffer:find('\r?\n\r?\n$', 1) then
+          buffer = buffer .. '\n\n'
+        end
+        process_buffer()
+      end
+      -- OpenAI SSE 流末尾的 [DONE] 标记
+      table.insert(pending, 'data: [DONE]\n\n')
+      local ok_flush = flush_pending()
+      if not ok_flush then
+        return nil, 'failed to flush final anthropic stream'
+      end
+      return true
+    end
+    buffer = buffer .. chunk
+    process_buffer()
+    local ok_flush = flush_pending()
+    if not ok_flush then
+      return nil, 'failed to flush anthropic stream chunk'
+    end
+  end
+end
+
+-- opts.skip_current_provider: 为 true 时不尝试当前 provider 的其他 key，直接切换 provider
+local function pick_retry_target(cfg, std_model, endpoint_key, current_provider, current_model, attempted_keys_by_provider, exhausted_providers, opts)
+  opts = opts or {}
+  local skip_current = not not opts.skip_current_provider
+
+  if not skip_current then
+    local current_attempts = attempted_keys_by_provider[current_provider.name] or {}
+    local retry_key = keypool.pick_key(current_provider, { exclude_key_ids = current_attempts })
+    if retry_key then
+      return current_provider, current_model, retry_key
+    end
   end
 
   exhausted_providers[current_provider.name] = true
@@ -491,7 +867,7 @@ function _M.handle(endpoint_key)
   local stream_body = deep_copy(body)
   apply_provider_request_defaults(stream_body, provider)
   stream_body.model = provider_model
-  local body_json, encode_err = rewrite.encode_body(stream_body)
+  local body_json, encode_err = encode_body_for_provider(stream_body, provider)
   if not body_json then
     ngx.ctx.error_type = 'invalid_request'
     return errors.bad_request('failed to encode body: ' .. tostring(encode_err))
@@ -531,7 +907,11 @@ function _M.handle(endpoint_key)
       local attempt_body = deep_copy(body)
       apply_provider_request_defaults(attempt_body, provider)
       attempt_body.model = provider_model
-      local encoded, body_err = rewrite.encode_body(attempt_body)
+      -- Gemini: 从缓存回注 thought_signature，防止 400 missing thought_signature
+      if gemini_sig.is_gemini_provider(provider) then
+        gemini_sig.inject_into_body(attempt_body)
+      end
+      local encoded, body_err = encode_body_for_provider(attempt_body, provider)
       if not encoded then
         ngx.ctx.error_type = 'invalid_request'
         return errors.bad_request('failed to encode body: ' .. tostring(body_err))
@@ -555,6 +935,7 @@ function _M.handle(endpoint_key)
         body = body_json,
         timeout_ms = provider.timeout_ms,
         ssl_verify = provider.ssl_verify,
+        proxy_url = provider.proxy_url,
       })
 
       if not stream_res and req_err then
@@ -584,11 +965,30 @@ function _M.handle(endpoint_key)
         break
       end
 
-      if should_cooldown_key(last_res and last_res.status or nil, last_res, req_err) then
-        keypool.mark_key_cooldown(provider, key.id, runtime.key_cooldown_sec, {
-          source = 'stream_retry',
-          status = last_res and last_res.status or nil,
-        })
+      local analysis = analyze_error_for_retry(last_res and last_res.status or nil, last_res, req_err)
+      local cooldown_opts = {
+        source = 'stream_retry',
+        status = last_res and last_res.status or nil,
+        limit_source = (extract_error_metadata(last_res) or {}).limit_source,
+      }
+
+      if analysis.cooldown_key then
+        local ttl = analysis.key_cooldown_sec or runtime.key_cooldown_sec
+        keypool.mark_key_cooldown(provider, key.id, ttl, cooldown_opts)
+      elseif should_cooldown_key(last_res and last_res.status or nil, last_res, req_err) then
+        -- 兼容老逻辑兜底（400 类错误模式匹配）
+        keypool.mark_key_cooldown(provider, key.id, runtime.key_cooldown_sec, cooldown_opts)
+      end
+
+      if analysis.cooldown_provider_model then
+        local ttl = analysis.pm_cooldown_sec or runtime.provider_model_cooldown_sec
+        keypool.mark_provider_model_cooldown(provider.name, provider_model, ttl, cooldown_opts)
+        ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] stream cooldown (provider,model)=', provider.name, '/', provider_model, ' for ', ttl, 's; reason=shared_pool_rate_limit')
+      end
+
+      -- 退避（如果是在换 provider 而不是等 key，也可以小睡一下避免打爆下游）
+      if attempt >= 2 then
+        retry_backoff_sleep(attempt)
       end
 
       local next_provider, next_model, next_key = pick_retry_target(
@@ -598,7 +998,8 @@ function _M.handle(endpoint_key)
         provider,
         provider_model,
         attempted_keys_by_provider,
-        exhausted_providers
+        exhausted_providers,
+        { skip_current_provider = analysis.skip_same_provider }
       )
       if not next_provider then
         break
@@ -634,7 +1035,11 @@ function _M.handle(endpoint_key)
       copy_response_headers(last_res.headers)
       observe.maybe_expose_selection(final_provider, final_key)
       ngx.status = last_res.status
-      ngx.say(inject_channel_to_json_response(last_res.body or '', final_provider.name))
+      if anthropic.is_anthropic(final_provider) then
+        ngx.say(anthropic.translate_error_response(last_res.body or ''))
+      else
+        ngx.say(inject_channel_to_json_response(last_res.body or '', final_provider.name))
+      end
       return ngx.exit(last_res.status)
     end
 
@@ -642,9 +1047,16 @@ function _M.handle(endpoint_key)
     ngx.ctx.error_type = nil
     copy_response_headers(stream_res.headers)
     ngx.header['X-Accel-Buffering'] = 'no'
+    -- 对客户端保持 OpenAI SSE 格式：text/event-stream
+    ngx.header['Content-Type'] = 'text/event-stream'
     observe.maybe_expose_selection(final_provider, final_key)
     ngx.status = 200
-    local relay_ok, relay_err = relay_stream_response(stream_res)
+    local relay_ok, relay_err
+    if anthropic.is_anthropic(final_provider) then
+      relay_ok, relay_err = relay_anthropic_stream(stream_res, final_model, ngx.ctx.request_id)
+    else
+      relay_ok, relay_err = relay_stream_response(stream_res, final_provider)
+    end
     stream_res.close()
     if not relay_ok then
       ngx.log(ngx.ERR, '[', format_timestamp(), '] [openai_compat] stream relay failed: provider=', final_provider.name, ', key_id=', final_key.id, ', error=', relay_err)
@@ -681,7 +1093,11 @@ function _M.handle(endpoint_key)
     local attempt_body = deep_copy(body)
     apply_provider_request_defaults(attempt_body, provider)
     attempt_body.model = provider_model
-    local encoded, body_err = rewrite.encode_body(attempt_body)
+    -- Gemini: 从缓存回注 thought_signature，防止 400 missing thought_signature
+    if gemini_sig.is_gemini_provider(provider) then
+      gemini_sig.inject_into_body(attempt_body)
+    end
+    local encoded, body_err = encode_body_for_provider(attempt_body, provider)
     if not encoded then
       ngx.ctx.error_type = 'invalid_request'
       return errors.bad_request('failed to encode body: ' .. tostring(body_err))
@@ -713,11 +1129,30 @@ function _M.handle(endpoint_key)
       break
     end
 
-    if should_cooldown_key(res and res.status or nil, res, req_err) then
-      keypool.mark_key_cooldown(provider, key.id, runtime.key_cooldown_sec, {
-        source = 'non_stream_retry',
-        status = res and res.status or nil,
-      })
+    local analysis = analyze_error_for_retry(res and res.status or nil, res, req_err)
+    local cooldown_opts = {
+      source = 'non_stream_retry',
+      status = res and res.status or nil,
+      limit_source = (extract_error_metadata(res) or {}).limit_source,
+    }
+
+    if analysis.cooldown_key then
+      local ttl = analysis.key_cooldown_sec or runtime.key_cooldown_sec
+      keypool.mark_key_cooldown(provider, key.id, ttl, cooldown_opts)
+    elseif should_cooldown_key(res and res.status or nil, res, req_err) then
+      -- 兼容老逻辑兜底（400 类错误模式匹配）
+      keypool.mark_key_cooldown(provider, key.id, runtime.key_cooldown_sec, cooldown_opts)
+    end
+
+    if analysis.cooldown_provider_model then
+      local ttl = analysis.pm_cooldown_sec or runtime.provider_model_cooldown_sec
+      keypool.mark_provider_model_cooldown(provider.name, provider_model, ttl, cooldown_opts)
+      ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] non-stream cooldown (provider,model)=', provider.name, '/', provider_model, ' for ', ttl, 's; reason=shared_pool_rate_limit')
+    end
+
+    -- 指数退避
+    if attempt >= 2 then
+      retry_backoff_sleep(attempt)
     end
 
     local next_provider, next_model, next_key = pick_retry_target(
@@ -727,7 +1162,8 @@ function _M.handle(endpoint_key)
       provider,
       provider_model,
       attempted_keys_by_provider,
-      exhausted_providers
+      exhausted_providers,
+      { skip_current_provider = analysis.skip_same_provider }
     )
     if not next_provider then
       break
@@ -765,7 +1201,19 @@ function _M.handle(endpoint_key)
   observe.maybe_expose_selection(final_provider, final_key)
 
   ngx.status = res.status
-  ngx.say(inject_channel_to_json_response(res.body or '', final_provider.name))
+  if anthropic.is_anthropic(final_provider) then
+    if res.status == 200 then
+      ngx.say(anthropic.translate_response(res.body or '', final_model, final_provider.name))
+    else
+      ngx.say(anthropic.translate_error_response(res.body or ''))
+    end
+  else
+    -- Gemini: 非流式 200 响应中捕获 thought_signature，供后续请求回注
+    if res.status == 200 and gemini_sig.is_gemini_provider(final_provider) then
+      gemini_sig.capture_from_response(res.body)
+    end
+    ngx.say(inject_channel_to_json_response(res.body or '', final_provider.name))
+  end
   return ngx.exit(res.status)
 end
 

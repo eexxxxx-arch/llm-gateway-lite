@@ -32,3 +32,24 @@ models:
       - "google/gemini-3-flash-preview"
     provider_map:
       gemini: "gemini-3-flash-preview"
+
+  claude-3-5-sonnet:
+    # Claude 模型通过 anthropic provider 接入，对客户端仍然是 OpenAI 兼容接口
+    aliases:
+      - "claude-3-5-sonnet"
+      - "claude-3-5-sonnet-latest"
+      - "anthropic/claude-3-5-sonnet"
+    provider_map:
+      anthropic: "claude-3-5-sonnet-latest"
+    policy:
+      default_provider: "anthropic"
+
+  claude-3-haiku:
+    aliases:
+      - "claude-3-haiku"
+      - "claude-3-haiku-latest"
+      - "anthropic/claude-3-haiku"
+    provider_map:
+      anthropic: "claude-3-haiku-latest"
+    policy:
+      default_provider: "anthropic"

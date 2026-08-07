@@ -170,6 +170,10 @@ local function normalize_config(cfg)
           weight = tonumber(provider.weight) or 1,
           timeout_ms = tonumber(provider.timeout_ms) or 60000,
           ssl_verify = provider.ssl_verify,
+          -- HTTP 代理地址（可选）：形如 http://host:port，用于访问被墙/受限的上游
+          proxy_url = provider.proxy_url,
+          -- Anthropic 专用：覆盖默认的 anthropic-version 头部（默认 2023-06-01）
+          anthropic_version = provider.anthropic_version,
           keys = {},
         }
 

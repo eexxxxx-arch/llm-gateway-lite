@@ -563,20 +563,7 @@ ngx.say([[
       }).join('');
     }
 
-    async function refresh() {
-      if (document.hidden) return;
-      const windowMinutes = document.getElementById('window_minutes').value;
-      const params = new URLSearchParams(window.location.search);
-      const adminToken = params.get('admin_token');
-      const statsUrl = new URL('/admin/stats', window.location.origin);
-      statsUrl.searchParams.set('window', windowMinutes);
-      if (adminToken) {
-        statsUrl.searchParams.set('admin_token', adminToken);
-      }
-
-      const res = await fetch(statsUrl.toString(), { cache: 'no-store' });
-      if (!res.ok) return;
-      const data = await res.json();
+    function renderData(data) {
       window.__series = data.series || [];
       const t = data.totals || {};
       const wt = data.window_totals || {};
@@ -593,7 +580,6 @@ ngx.say([[
         const p = k.provider;
         if (!p) return;
         byProviderFromKeys[p] = Number(byProviderFromKeys[p] || 0) + Number(k.window_total || 0);
-        // 用 key 维度 4xx 作为失败下限补齐，避免旧数据里 provider 维度为空时整表失真
         byProviderFailFromKeys[p] = Number(byProviderFailFromKeys[p] || 0) + Number(k.window_4xx || 0);
       });
       const mergedByProvider = Object.assign({}, byProvider);
@@ -628,7 +614,7 @@ ngx.say([[
       document.getElementById('err_hint').textContent = '错误类型 ' + fmt(Object.keys(byErr).length) + ' 种';
       document.getElementById('providers_hint').textContent = '出现失败 ' + fmt(Object.keys(mergedByProviderFail).length) + ' 个';
       document.getElementById('series_hint').textContent = '采样点: ' + fmt(window.__series.length);
-      document.getElementById('updated').textContent = '更新时间: ' + new Date().toLocaleString();
+      document.getElementById('updated').textContent = '更新时间: ' + new Date().toLocaleString() + ' (SSE)';
       renderStatus(by);
       renderErrors(byErr);
 
@@ -709,6 +695,97 @@ ngx.say([[
       draw(window.__series);
     }
 
+    async function refresh() {
+      if (document.hidden) return;
+      const windowMinutes = document.getElementById('window_minutes').value;
+      const params = new URLSearchParams(window.location.search);
+      const adminToken = params.get('admin_token');
+      const statsUrl = new URL('/admin/stats', window.location.origin);
+      statsUrl.searchParams.set('window', windowMinutes);
+      if (adminToken) {
+        statsUrl.searchParams.set('admin_token', adminToken);
+      }
+
+      const res = await fetch(statsUrl.toString(), { cache: 'no-store' });
+      if (!res.ok) return;
+      const data = await res.json();
+      renderData(data);
+    }
+
+    let sseSource = null;
+    let sseFallbackTimer = null;
+
+    function stopSSE() {
+      if (sseSource) {
+        try { sseSource.close(); } catch (e) {}
+        sseSource = null;
+      }
+      if (sseFallbackTimer) {
+        clearInterval(sseFallbackTimer);
+        sseFallbackTimer = null;
+      }
+    }
+
+    function startSSE() {
+      stopSSE();
+      if (typeof EventSource === 'undefined') {
+        sseFallbackTimer = setInterval(refresh, 10000);
+        return;
+      }
+      const windowMinutes = document.getElementById('window_minutes').value;
+      const params = new URLSearchParams(window.location.search);
+      const adminToken = params.get('admin_token');
+      const sseUrl = new URL('/admin/stats/stream', window.location.origin);
+      sseUrl.searchParams.set('window', windowMinutes);
+      sseUrl.searchParams.set('interval', 3);
+      if (adminToken) {
+        sseUrl.searchParams.set('admin_token', adminToken);
+      }
+
+      let gotAnyEvent = false;
+      let watchdog = setTimeout(() => {
+        if (!gotAnyEvent) {
+          console.warn('[SSE] watchdog: no events in 15s, falling back to polling');
+          stopSSE();
+          sseFallbackTimer = setInterval(refresh, 10000);
+        }
+      }, 15000);
+
+      try {
+        sseSource = new EventSource(sseUrl.toString(), { withCredentials: true });
+      } catch (e) {
+        clearTimeout(watchdog);
+        sseFallbackTimer = setInterval(refresh, 10000);
+        return;
+      }
+
+      sseSource.addEventListener('connected', (ev) => {
+        gotAnyEvent = true;
+        clearTimeout(watchdog);
+        try {
+          const meta = JSON.parse(ev.data);
+          document.getElementById('updated').textContent = 'SSE 已连接 · 推送间隔 ' + (meta.interval_sec || 3) + 's';
+        } catch (e) {}
+      });
+
+      sseSource.addEventListener('snapshot', (ev) => {
+        gotAnyEvent = true;
+        clearTimeout(watchdog);
+        try {
+          const data = JSON.parse(ev.data);
+          renderData(data);
+        } catch (e) {}
+      });
+
+      sseSource.addEventListener('error', () => {
+        clearTimeout(watchdog);
+        if (sseSource && sseSource.readyState === EventSource.CLOSED) {
+          stopSSE();
+          sseFallbackTimer = setInterval(refresh, 10000);
+        }
+      });
+    }
+
     (function syncTabLinks() {
       const params = new URLSearchParams(window.location.search);
       const adminToken = params.get('admin_token');
@@ -719,11 +796,20 @@ ngx.say([[
     })();
 
     window.addEventListener('resize', () => draw(window.__series || []));
-    document.addEventListener('visibilitychange', refresh);
-    document.getElementById('window_minutes').addEventListener('change', refresh);
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) {
+        stopSSE();
+      } else {
+        if (!sseSource) startSSE();
+      }
+    });
+    document.getElementById('window_minutes').addEventListener('change', () => {
+      refresh();
+      startSSE();
+    });
     document.getElementById('btn_refresh').addEventListener('click', refresh);
-    setInterval(refresh, 10000);
     refresh();
+    startSSE();
   </script>
 </body>
 </html>

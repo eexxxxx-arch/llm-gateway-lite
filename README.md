@@ -50,6 +50,7 @@
 - OpenAI
 - OpenRouter
 - Google Gemini
+- Anthropic（Claude，原生 Messages API 自动转换为 OpenAI 格式）
 - 智谱 AI (GLM)
 - 阿里云百炼
 - 其他 OpenAI 兼容 API
@@ -190,14 +191,18 @@ configs/
 
 | 配置项 | 类型 | 必填 | 说明 |
 |--------|------|------|------|
-| `type` | string | ✅ | Provider 类型，目前支持 `openai_compat` |
+| `type` | string | ✅ | Provider 类型，支持 `openai_compat`（默认）和 `anthropic` |
 | `base_url` | string | ✅ | API 基础 URL |
 | `endpoints` | object | ✅ | 端点配置（chat_completions、embeddings） |
-| `auth` | object | ✅ | 认证配置（mode、header、prefix） |
+| `auth` | object | ❌ | 认证配置（mode、header、prefix）。`type=anthropic` 时可省略，自动使用 `x-api-key` |
 | `keys` | array | ✅ | API Key 列表（支持多 Key 轮询） |
 | `weight` | int | ❌ | 权重（用于负载均衡，默认 1） |
 | `timeout_ms` | int | ❌ | 超时时间（毫秒，默认 60000） |
 | `ssl_verify` | bool | ❌ | 是否验证 SSL 证书（默认 true） |
+| `anthropic_version` | string | ❌ | 仅 `type=anthropic`：覆盖 `anthropic-version` 头（默认 `2023-06-01`） |
+| `request_defaults` | object | ❌ | 该 provider 所有请求的默认参数（不覆盖客户端显式传入值） |
+
+> 💡 **Anthropic 说明**：当 `type: anthropic` 时，网关自动把 OpenAI Chat Completions 请求转成 Anthropic Messages 格式（system 消息提到顶层、`max_tokens` 必填、`stop`→`stop_sequences` 等），并把 Anthropic 响应（含流式 SSE）转回 OpenAI 格式，客户端无需任何改动。endpoints 需配置 `chat_completions: "/v1/messages"`。
 
 ### models.yaml 配置项
 

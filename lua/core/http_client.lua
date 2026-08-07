@@ -120,16 +120,72 @@ local function open_socket_and_send(opts)
     return nil, nil, err
   end
 
+  -- 解析 HTTP 代理（可选）：opts.proxy_url 形如 http://host:port
+  local proxy = nil
+  if type(opts.proxy_url) == 'string' and opts.proxy_url ~= '' then
+    proxy, err = parse_url(opts.proxy_url)
+    if not proxy then
+      return nil, nil, 'invalid proxy_url: ' .. tostring(opts.proxy_url)
+    end
+    if proxy.scheme ~= 'http' then
+      return nil, nil, 'only http proxy scheme is supported, got: ' .. tostring(proxy.scheme)
+    end
+  end
+
   local sock = ngx.socket.tcp()
   if opts.timeout_ms then
     sock:settimeout(opts.timeout_ms)
     ngx.log(ngx.INFO, '[', format_timestamp(), '] [http_client] setting timeout: ', opts.timeout_ms, 'ms for url=', opts.url)
   end
 
-  local ok, conn_err = sock:connect(parsed.host, parsed.port)
+  -- 通过代理连接时，TCP 连接到代理而非目标；否则直连目标
+  local connect_host = proxy and proxy.host or parsed.host
+  local connect_port = proxy and proxy.port or parsed.port
+
+  local ok, conn_err = sock:connect(connect_host, connect_port)
   if not ok then
-    ngx.log(ngx.ERR, '[', format_timestamp(), '] [http_client] connection failed: url=', opts.url, ', host=', parsed.host, ', port=', parsed.port, ', error=', conn_err)
+    ngx.log(ngx.ERR, '[', format_timestamp(), '] [http_client] connection failed: url=', opts.url, ', host=', connect_host, ', port=', connect_port, ', proxy=', proxy and opts.proxy_url or 'none', ', error=', conn_err)
     return nil, nil, conn_err
+  end
+
+  -- HTTPS 目标经 HTTP 代理：先发 CONNECT 建立隧道，再做 TLS 握手
+  if proxy and parsed.scheme == 'https' then
+    local connect_target = parsed.host .. ':' .. parsed.port
+    local connect_req = 'CONNECT ' .. connect_target .. ' HTTP/1.1\r\n' ..
+                        'Host: ' .. connect_target .. '\r\n' ..
+                        'Proxy-Connection: keep-alive\r\n\r\n'
+    local sent, send_err = sock:send(connect_req)
+    if not sent then
+      ngx.log(ngx.ERR, '[', format_timestamp(), '] [http_client] proxy CONNECT send failed: url=', opts.url, ', proxy=', opts.proxy_url, ', error=', send_err)
+      sock:close()
+      return nil, nil, 'proxy CONNECT send failed: ' .. tostring(send_err)
+    end
+
+    local status_line, sl_err = sock:receive('*l')
+    if not status_line then
+      ngx.log(ngx.ERR, '[', format_timestamp(), '] [http_client] proxy CONNECT no response: url=', opts.url, ', proxy=', opts.proxy_url, ', error=', sl_err)
+      sock:close()
+      return nil, nil, 'proxy CONNECT failed: ' .. tostring(sl_err)
+    end
+
+    local _, proxy_status_str = status_line:match('^(HTTP/%d+%.%d+)%s+(%d+)')
+    local proxy_status = tonumber(proxy_status_str)
+
+    -- 读取并丢弃 CONNECT 响应剩余的头部
+    while true do
+      local line, h_err = sock:receive('*l')
+      if not line or line == '' then
+        break
+      end
+    end
+
+    if not proxy_status or proxy_status < 200 or proxy_status >= 300 then
+      ngx.log(ngx.ERR, '[', format_timestamp(), '] [http_client] proxy CONNECT rejected: url=', opts.url, ', proxy=', opts.proxy_url, ', status=', status_line)
+      sock:close()
+      return nil, nil, 'proxy CONNECT rejected: ' .. tostring(status_line)
+    end
+
+    ngx.log(ngx.INFO, '[', format_timestamp(), '] [http_client] proxy CONNECT established: url=', opts.url, ', proxy=', opts.proxy_url)
   end
 
   if parsed.scheme == 'https' then
@@ -151,7 +207,13 @@ local function open_socket_and_send(opts)
     headers['Content-Length'] = #opts.body
   end
 
-  local lines = { method .. ' ' .. parsed.path .. ' HTTP/1.1' }
+  -- HTTP 目标经 HTTP 代理（未走 CONNECT）：请求行使用绝对 URI；其余情况使用相对路径
+  local request_target = parsed.path
+  if proxy and parsed.scheme == 'http' then
+    request_target = opts.url
+  end
+
+  local lines = { method .. ' ' .. request_target .. ' HTTP/1.1' }
   for name, value in pairs(headers) do
     table.insert(lines, name .. ': ' .. tostring(value))
   end

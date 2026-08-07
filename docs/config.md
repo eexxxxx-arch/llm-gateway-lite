@@ -23,6 +23,7 @@ providers:
     weight: 1
     timeout_ms: 60000
     ssl_verify: true
+    proxy_url: "http://host:port"  # 可选，HTTP 代理（HTTPS 目标走 CONNECT 隧道）
 ```
 
 ## models.yaml

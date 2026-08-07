@@ -8,6 +8,10 @@ local function cooldown_key(provider, key_id)
   return 'cooldown:' .. provider.name .. ':' .. key_id
 end
 
+local function cooldown_provider_model(provider_name, provider_model)
+  return 'cooldown_pm:' .. provider_name .. ':' .. tostring(provider_model)
+end
+
 function _M.is_key_available(provider, key)
   if not key then
     return false
@@ -27,6 +31,38 @@ function _M.mark_key_cooldown(provider, key_id, ttl, opts)
   if provider and provider.name and key_id then
     stats.record_key_cooldown(provider.name, key_id, ttl, opts)
   end
+end
+
+-- provider-model 组合级别冷却：用于共享池限流（同 provider 所有 key 换了都没用的场景）
+function _M.is_provider_model_available(provider_name, provider_model)
+  if not state then
+    return true
+  end
+  if not provider_name or not provider_model then
+    return true
+  end
+  local value = state:get(cooldown_provider_model(provider_name, provider_model))
+  return value == nil
+end
+
+function _M.mark_provider_model_cooldown(provider_name, provider_model, ttl, opts)
+  if not state then
+    return
+  end
+  if not provider_name or not provider_model then
+    return
+  end
+  state:set(cooldown_provider_model(provider_name, provider_model), true, ttl)
+  if opts == nil then
+    opts = {}
+  end
+  opts.scope = 'provider_model'
+  -- 复用 stats 接口（若存在），不抛出错误
+  pcall(function()
+    if stats and stats.record_key_cooldown then
+      stats.record_key_cooldown(provider_name, 'model:' .. tostring(provider_model), ttl, opts)
+    end
+  end)
 end
 
 function _M.pick_key(provider, opts)
