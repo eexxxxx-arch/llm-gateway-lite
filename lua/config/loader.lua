@@ -170,8 +170,9 @@ local function normalize_config(cfg)
           weight = tonumber(provider.weight) or 1,
           timeout_ms = tonumber(provider.timeout_ms) or 60000,
           ssl_verify = provider.ssl_verify,
-          -- HTTP 代理地址（可选）：形如 http://host:port，用于访问被墙/受限的上游
-          proxy_url = provider.proxy_url,
+          -- HTTP 代理地址（可选）：支持直接配置 proxy_url 或从环境变量读取 proxy_url_env
+          -- proxy_url_env 优先级更高，便于在 nginx/docker-compose 层统一配置代理
+          proxy_url = provider.proxy_url_env and os.getenv(provider.proxy_url_env) or provider.proxy_url,
           -- Anthropic 专用：覆盖默认的 anthropic-version 头部（默认 2023-06-01）
           anthropic_version = provider.anthropic_version,
           keys = {},

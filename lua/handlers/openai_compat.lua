@@ -400,6 +400,23 @@ local function extract_retry_after_sec(headers)
   return nil
 end
 
+-- 识别连接级错误（SSL 握手失败、连接拒绝、超时等）
+-- 这类错误换 key 无意义，应该跳过当前 provider 剩余 key，直接换 provider
+local function is_connection_error(err)
+  if not err or type(err) ~= 'string' then
+    return false
+  end
+  local lower = err:lower()
+  return lower:find('handshake', 1, true)
+    or lower:find('connection refused', 1, true)
+    or lower:find('connection reset', 1, true)
+    or lower:find('connection closed', 1, true)
+    or lower:find('no such host', 1, true)
+    or lower:find('timeout', 1, true)
+    or lower:find('timed out', 1, true)
+    or lower:find('proxy connect', 1, true)
+end
+
 -- 对 4xx/5xx 响应做结构化分析，返回给重试循环决策
 -- 返回: {
 --   cooldown_key: bool,              -- 是否需要冷却当前 key
@@ -417,7 +434,18 @@ local function analyze_error_for_retry(status, res, err)
     pm_cooldown_sec = nil,
   }
   if err then
-    -- 连接/超时/网络错误：不冷却 key，仅走重试逻辑
+    -- 连接级错误：换 key 无意义，跳过当前 provider 剩余 key，直接换 provider
+    if is_connection_error(err) then
+      local r = {
+        cooldown_key = true,
+        cooldown_provider_model = true,
+        skip_same_provider = true,
+        key_cooldown_sec = 10,
+        pm_cooldown_sec = 30,
+      }
+      return r
+    end
+    -- 其他网络错误（非连接级）：不冷却 key，仅走重试逻辑
     return default
   end
   if not status then
@@ -949,7 +977,6 @@ function _M.handle(endpoint_key)
       })
 
       if not stream_res and req_err then
-        ngx.log(ngx.ERR, '[', format_timestamp(), '] [openai_compat] stream request failed: provider=', provider.name, ', url=', url, ', error=', req_err, ', key_id=', key.id)
         log_failed_request(provider, url, request_headers, body_json, nil, req_err)
         last_res = nil
       elseif stream_res and stream_res.status ~= 200 then
@@ -993,7 +1020,7 @@ function _M.handle(endpoint_key)
       if analysis.cooldown_provider_model then
         local ttl = analysis.pm_cooldown_sec or runtime.provider_model_cooldown_sec
         keypool.mark_provider_model_cooldown(provider.name, provider_model, ttl, cooldown_opts)
-        ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] stream cooldown (provider,model)=', provider.name, '/', provider_model, ' for ', ttl, 's; reason=shared_pool_rate_limit')
+        ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] stream cooldown (provider,model)=', provider.name, '/', provider_model, ' for ', ttl, 's; reason=', is_connection_error(req_err) and 'connection_error' or 'shared_pool_rate_limit')
       end
 
       -- 退避（如果是在换 provider 而不是等 key，也可以小睡一下避免打爆下游）
@@ -1070,6 +1097,28 @@ function _M.handle(endpoint_key)
     stream_res.close()
     if not relay_ok then
       ngx.log(ngx.ERR, '[', format_timestamp(), '] [openai_compat] stream relay failed: provider=', final_provider.name, ', key_id=', final_key.id, ', error=', relay_err)
+
+      -- 中继阶段出错：虽然已向客户端发送 200（无法再改状态码），
+      -- 但必须正确标记错误分类并触发 cooldown，避免后续请求继续撞同一个有问题的上游
+      ngx.ctx.error_type = classify_error(nil, relay_err)
+
+      local analysis = analyze_error_for_retry(nil, nil, relay_err)
+      local cooldown_opts = {
+        source = 'stream_relay_failed',
+        status = nil,
+        limit_source = nil,
+      }
+
+      if analysis.cooldown_key then
+        local ttl = analysis.key_cooldown_sec or runtime.key_cooldown_sec
+        keypool.mark_key_cooldown(final_provider, final_key.id, ttl, cooldown_opts)
+      end
+
+      if analysis.cooldown_provider_model then
+        local ttl = analysis.pm_cooldown_sec or runtime.provider_model_cooldown_sec
+        keypool.mark_provider_model_cooldown(final_provider.name, final_model, ttl, cooldown_opts)
+        ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] stream relay cooldown (provider,model)=', final_provider.name, '/', final_model, ' for ', ttl, 's; reason=', is_connection_error(relay_err) and 'connection_error' or 'relay_error')
+      end
     end
     return ngx.exit(200)
   end
@@ -1126,10 +1175,8 @@ function _M.handle(endpoint_key)
     res, req_err = do_request(provider, key, final_endpoint, body_json, ngx.ctx.request_id)
 
     if not res and req_err then
-      ngx.log(ngx.ERR, '[', format_timestamp(), '] [openai_compat] request failed: provider=', provider.name, ', url=', url, ', error=', req_err, ', key_id=', key.id)
       log_failed_request(provider, url, request_headers, body_json, nil, req_err)
     elseif res and res.status ~= 200 then
-      ngx.log(ngx.WARN, '[', format_timestamp(), '] [openai_compat] request response: provider=', provider.name, ', status=', res.status, ', body_size=', #(res.body or ''))
       log_failed_request(provider, url, request_headers, body_json, res, nil)
     elseif res then
       ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] request response: provider=', provider.name, ', status=', res.status, ', body_size=', #(res.body or ''))
@@ -1157,7 +1204,7 @@ function _M.handle(endpoint_key)
     if analysis.cooldown_provider_model then
       local ttl = analysis.pm_cooldown_sec or runtime.provider_model_cooldown_sec
       keypool.mark_provider_model_cooldown(provider.name, provider_model, ttl, cooldown_opts)
-      ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] non-stream cooldown (provider,model)=', provider.name, '/', provider_model, ' for ', ttl, 's; reason=shared_pool_rate_limit')
+      ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] non-stream cooldown (provider,model)=', provider.name, '/', provider_model, ' for ', ttl, 's; reason=', is_connection_error(req_err) and 'connection_error' or 'shared_pool_rate_limit')
     end
 
     -- 指数退避

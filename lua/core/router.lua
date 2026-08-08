@@ -117,9 +117,14 @@ function _M.select_provider_with_key(config, std_model, opts)
   end
 
   if #candidates == 0 then
-    -- 兜底：如果所有候选都因为 provider-model 冷却被排除，放宽限制（避免无 provider 可用）
+    -- 兜底：所有候选都不可用时，再扫描一次（不放宽 provider-model 冷却，只避免前面分支的漏判）
+    -- 如果所有 provider-model 确实都在冷却中，严格遵守冷却时间，返回无 provider 可用
+    -- 否则会把 cooldown 机制完全架空，导致连接错误的 provider 被立即反复撞击
     for provider_name, provider_model in pairs(model.provider_map or {}) do
-      if not exclude[provider_name] and allow_provider(model.policy, provider_name) then
+      if not exclude[provider_name]
+        and allow_provider(model.policy, provider_name)
+        and provider_model_ready(provider_name, provider_model)
+      then
         local provider = config.providers[provider_name]
         if provider and keypool.has_available_key(provider) then
           local weight = tonumber(provider.weight) or 1
