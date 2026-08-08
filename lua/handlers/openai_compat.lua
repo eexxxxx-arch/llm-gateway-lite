@@ -655,9 +655,31 @@ local function relay_stream_response(stream_res, provider)
   local sig_state = do_capture and gemini_sig.new_stream_state() or nil
   local line_buffer = ''
 
+  -- 推理模型（如 glm-5.2）在吐 token 过程中可能有长时间停顿（reasoning 计算），
+  -- 上游 cosocket 的 read idle 超时较长（代理下 10min），但前端（opencode 等）
+  -- SSE 客户端通常在 60~120s 无下游数据时判定超时；因此在 chunk 间空闲时向
+  -- 客户端注入 SSE 注释 ping（`: comment\n\n`），保持下行方向有字节流动。
+  -- ping 间隔设 15s：多数前端 idle 超时阈值 ≥ 60s，留有安全余量。
+  local RELAY_PING_INTERVAL_S = 15
+  local last_client_tx_at = ngx.now()
+
+  local function emit_relay_ping_if_idle(force)
+    local now = ngx.now()
+    if force or (now - last_client_tx_at) >= RELAY_PING_INTERVAL_S then
+      local ok, _ = ngx.print(': ping (stream is still active, waiting for next token)\n\n')
+      if ok then ngx.flush(true) end
+      last_client_tx_at = now
+    end
+  end
+
   while true do
+    -- 每次读 chunk 前先检查是否该向客户端送 ping（读可能阻塞很久）
+    emit_relay_ping_if_idle(false)
     local chunk, chunk_err = stream_res.read_chunk()
     if chunk_err then
+      -- read_chunk 内部阻塞返回错误时也先补一条 ping，避免最后一次客户端接收时间
+      -- 距离实际错误发生时刻间隔过长
+      emit_relay_ping_if_idle(true)
       return nil, chunk_err
     end
     if not chunk then
@@ -690,6 +712,7 @@ local function relay_stream_response(stream_res, provider)
     if not ok_flush then
       return nil, flush_err or 'failed to flush chunk'
     end
+    last_client_tx_at = ngx.now()
   end
 end
 
@@ -764,9 +787,31 @@ local function relay_anthropic_stream(stream_res, provider_model, request_id)
     end
   end
 
+  -- 同 relay_stream_response：Anthropic 中继也需要空闲时向客户端送 SSE 注释 ping
+  local ANTHROPIC_PING_INTERVAL_S = 15
+  local last_client_tx_at_a = ngx.now()
+  local function emit_anthropic_ping_if_idle(force)
+    local now = ngx.now()
+    if force or (now - last_client_tx_at_a) >= ANTHROPIC_PING_INTERVAL_S then
+      -- flush_pending 已经包含 ngx.print + ngx.flush；直接调用 flush_pending 保持一致
+      local ok, _ = ngx.print(': ping (stream is still active, waiting for next token)\n\n')
+      if ok then ngx.flush(true) end
+      last_client_tx_at_a = now
+    end
+  end
+  -- 包装 flush_pending：每次成功 flush 后更新最后发送时间
+  local orig_flush_pending = flush_pending
+  local function tracked_flush_pending()
+    local ok = orig_flush_pending()
+    if ok then last_client_tx_at_a = ngx.now() end
+    return ok
+  end
+
   while true do
+    emit_anthropic_ping_if_idle(false)
     local chunk, chunk_err = stream_res.read_chunk()
     if chunk_err then
+      emit_anthropic_ping_if_idle(true)
       return nil, chunk_err
     end
     if not chunk then
@@ -780,7 +825,7 @@ local function relay_anthropic_stream(stream_res, provider_model, request_id)
       end
       -- OpenAI SSE 流末尾的 [DONE] 标记
       table.insert(pending, 'data: [DONE]\n\n')
-      local ok_flush = flush_pending()
+      local ok_flush = tracked_flush_pending()
       if not ok_flush then
         return nil, 'failed to flush final anthropic stream'
       end
@@ -788,7 +833,7 @@ local function relay_anthropic_stream(stream_res, provider_model, request_id)
     end
     buffer = buffer .. chunk
     process_buffer()
-    local ok_flush = flush_pending()
+    local ok_flush = tracked_flush_pending()
     if not ok_flush then
       return nil, 'failed to flush anthropic stream chunk'
     end
@@ -927,6 +972,42 @@ function _M.handle(endpoint_key)
     local attempt = 0
     local last_res = nil
 
+    -- 流式请求：在进入 retry 循环前提前向客户端发送 SSE 响应头与首条 ping。
+    -- 目的：推理模型（glm-5.2 等）首字节延迟可达 60s+，前端（opencode）HTTP 客户端
+    -- 通常在 60~120s 无任何字节送达即超时断开；提前发 headers + SSE 注释 ping 让
+    -- 客户端"看到连接已建立"，后续 retry 期间继续定期 ping 维持链路存活。
+    -- 注意：一旦 ngx.print 发送了响应体字节，ngx.status 就无法再改（HTTP 语义限制）。
+    -- 因此若最终请求全部失败，网关仍会以 200 发送一条 SSE error 事件 + [DONE]，
+    -- 让调用方通过 SSE data 层而非 HTTP 状态码感知错误，保持流的完整性。
+    local sse_preamble_sent = false
+    local function ensure_sse_preamble()
+      if sse_preamble_sent then return end
+      ngx.header['Content-Type'] = 'text/event-stream; charset=utf-8'
+      ngx.header['Cache-Control'] = 'no-cache'
+      ngx.header['Connection'] = 'keep-alive'
+      ngx.header['X-Accel-Buffering'] = 'no'
+      observe.maybe_expose_selection(final_provider, final_key)
+      ngx.status = 200
+      ngx.send_headers()
+      local ok, err = ngx.print(': ping (establishing stream)\n\n')
+      if ok then ngx.flush(true) end
+      sse_preamble_sent = true
+    end
+    -- 客户端侧超时阈值多数为 60s，15s 一次 ping 留有充足余量（opencode 已另做调整）
+    local PING_INTERVAL_S = 15
+    local last_ping_at = ngx.now()
+    local function maybe_sse_ping(force)
+      if not sse_preamble_sent then return end
+      local now = ngx.now()
+      if force or (now - last_ping_at) >= PING_INTERVAL_S then
+        local ok, err = ngx.print(': ping (still waiting for upstream)\n\n')
+        if ok then ngx.flush(true) end
+        last_ping_at = now
+      end
+    end
+
+    ensure_sse_preamble()
+
     while attempt < max_attempts do
       attempt = attempt + 1
       final_provider = provider
@@ -936,7 +1017,12 @@ function _M.handle(endpoint_key)
 
       if not final_endpoint then
         ngx.ctx.error_type = 'config_error'
-        return errors.unavailable('provider endpoint not configured')
+        -- SSE preamble 已发（200），不能再改状态码；直接内联发 SSE error event
+        local _obj = { error = { message = 'provider endpoint not configured', type = 'config_error', code = 'config_error', http_status = 503 }, model = final_model, provider = final_provider.name, request_id = ngx.ctx.request_id }
+        ngx.print('event: error\ndata: ' .. (cjson.encode(_obj) or '{}') .. '\n\n')
+        ngx.print('data: [DONE]\n\n')
+        ngx.flush(true)
+        return ngx.exit(200)
       end
 
       attempted_keys_by_provider[provider.name] = attempted_keys_by_provider[provider.name] or {}
@@ -952,7 +1038,12 @@ function _M.handle(endpoint_key)
       local encoded, body_err = encode_body_for_provider(attempt_body, provider)
       if not encoded then
         ngx.ctx.error_type = 'invalid_request'
-        return errors.bad_request('failed to encode body: ' .. tostring(body_err))
+        local _msg = 'failed to encode body: ' .. tostring(body_err)
+        local _obj = { error = { message = _msg, type = 'invalid_request', code = 'invalid_request', http_status = 400 }, model = final_model, provider = final_provider.name, request_id = ngx.ctx.request_id }
+        ngx.print('event: error\ndata: ' .. (cjson.encode(_obj) or '{}') .. '\n\n')
+        ngx.print('data: [DONE]\n\n')
+        ngx.flush(true)
+        return ngx.exit(200)
       end
       body_json = encoded
 
@@ -965,6 +1056,8 @@ function _M.handle(endpoint_key)
       else
         ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] retrying stream with provider=', provider.name, ', url=', url, ', key_id=', key.id, ', attempt=', attempt)
       end
+
+      maybe_sse_ping(true)
 
       stream_res, req_err = http_client.request_stream({
         url = url,
@@ -998,6 +1091,8 @@ function _M.handle(endpoint_key)
         break
       end
 
+      maybe_sse_ping(true)
+
       if not should_retry(last_res, req_err) then
         break
       end
@@ -1024,9 +1119,24 @@ function _M.handle(endpoint_key)
       end
 
       -- 退避（如果是在换 provider 而不是等 key，也可以小睡一下避免打爆下游）
+      -- 退避期间也需要周期性向客户端送 ping，避免退避叠加让前端判定超时。
+      -- 这里不直接调用 retry_backoff_sleep，因为需要在 sleep 分片中插 ping。
       if attempt >= 2 then
-        retry_backoff_sleep(attempt)
+        local base = runtime.retry_backoff_base_ms or 50
+        local cap = 2000
+        local step = math.min(cap, base * math.pow(2, math.max(0, attempt - 1)))
+        local ms_left = step * (math.random() or 0.5)
+        while ms_left > 0 and sse_preamble_sent do
+          local chunk = math.min(ms_left, PING_INTERVAL_S * 1000)
+          if ngx.sleep then
+            ngx.sleep(chunk / 1000.0)
+          end
+          maybe_sse_ping(false)
+          ms_left = ms_left - chunk
+        end
       end
+
+      maybe_sse_ping(false)
 
       local next_provider, next_model, next_key = pick_retry_target(
         cfg,
@@ -1052,6 +1162,25 @@ function _M.handle(endpoint_key)
     ngx.ctx.provider_model = final_model
     ngx.ctx.key_id = final_key.id
 
+    -- 失败路径：SSE preamble 已发送（200 头 + ping 字节已到客户端），不能再改状态码。
+    -- 改为按 SSE 层语义发送一条 error 事件 + [DONE]，保持流格式一致，前端从 data 层感知错误。
+    local function emit_sse_error_chunk(code_name, message, http_status)
+      local err_obj = {
+        error = {
+          message = message,
+          type = code_name,
+          code = code_name,
+          http_status = http_status,
+        },
+        model = final_model,
+        provider = final_provider.name,
+        request_id = ngx.ctx.request_id,
+      }
+      local ok1, _ = ngx.print('event: error\ndata: ' .. (cjson.encode(err_obj) or '{}') .. '\n\n')
+      local ok2, _ = ngx.print('data: [DONE]\n\n')
+      if ok1 or ok2 then ngx.flush(true) end
+    end
+
     if not stream_res then
       if not last_res then
         local error_details = {
@@ -1065,29 +1194,43 @@ function _M.handle(endpoint_key)
         ngx.log(ngx.ERR, '[', format_timestamp(), '] [openai_compat] stream upstream request failed: ', cjson.encode(error_details))
         ngx.ctx.error_type = 'upstream_error'
         ngx.ctx.error_details = error_details
-        return errors.send(502, 'upstream request failed', 'upstream_error')
+        emit_sse_error_chunk('upstream_error', 'upstream request failed: ' .. tostring(req_err or 'unknown error'), 502)
+        return ngx.exit(200)
       end
       ngx.ctx.upstream_status = last_res.status
       ngx.ctx.error_type = classify_error(last_res.status, req_err)
-      copy_response_headers(last_res.headers)
-      observe.maybe_expose_selection(final_provider, final_key)
-      ngx.status = last_res.status
-      if anthropic.is_anthropic(final_provider) then
-        ngx.say(anthropic.translate_error_response(last_res.body or ''))
-      else
-        ngx.say(inject_channel_to_json_response(last_res.body or '', final_provider.name))
+      -- 保持 SSE 流语义：从 last_res.body 提取 provider 原生错误消息（如有），外层包一层 error event
+      local raw_msg = ''
+      do
+        local decoded = cjson.decode(last_res.body or '')
+        if type(decoded) == 'table' then
+          if type(decoded.error) == 'table' and type(decoded.error.message) == 'string' then
+            raw_msg = decoded.error.message
+          elseif type(decoded.message) == 'string' then
+            raw_msg = decoded.message
+          end
+        end
       end
-      return ngx.exit(last_res.status)
+      local msg = raw_msg ~= '' and raw_msg or ('upstream returned HTTP ' .. tostring(last_res.status))
+      -- OpenAI 兼容分类：映射到常见 code 名
+      local code_name = 'upstream_error'
+      local s = last_res.status or 500
+      if s == 401 or s == 403 then code_name = 'invalid_api_key'
+      elseif s == 429 then code_name = 'rate_limit_exceeded'
+      elseif s == 400 then code_name = 'invalid_request'
+      elseif s >= 500 then code_name = 'upstream_service_unavailable'
+      end
+      emit_sse_error_chunk(code_name, msg, s)
+      return ngx.exit(200)
     end
 
     ngx.ctx.upstream_status = 200
     ngx.ctx.error_type = nil
+    -- 注意：copy_response_headers 不应覆盖已设置的 Content-Type、X-Accel-Buffering 等 SSE 头
     copy_response_headers(stream_res.headers)
     ngx.header['X-Accel-Buffering'] = 'no'
-    -- 对客户端保持 OpenAI SSE 格式：text/event-stream
-    ngx.header['Content-Type'] = 'text/event-stream'
-    observe.maybe_expose_selection(final_provider, final_key)
-    ngx.status = 200
+    ngx.header['Content-Type'] = 'text/event-stream; charset=utf-8'
+    -- observe selection header 如果之前已设置，无需重复设置（幂等）
     local relay_ok, relay_err
     if anthropic.is_anthropic(final_provider) then
       relay_ok, relay_err = relay_anthropic_stream(stream_res, final_model, ngx.ctx.request_id)
