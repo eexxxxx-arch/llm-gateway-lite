@@ -1226,11 +1226,10 @@ function _M.handle(endpoint_key)
 
     ngx.ctx.upstream_status = 200
     ngx.ctx.error_type = nil
-    -- 注意：copy_response_headers 不应覆盖已设置的 Content-Type、X-Accel-Buffering 等 SSE 头
-    copy_response_headers(stream_res.headers)
-    ngx.header['X-Accel-Buffering'] = 'no'
-    ngx.header['Content-Type'] = 'text/event-stream; charset=utf-8'
-    -- observe selection header 如果之前已设置，无需重复设置（幂等）
+    -- SSE 响应头已在 ensure_sse_preamble() 中发送（Content-Type / Cache-Control / Connection /
+    -- X-Accel-Buffering / status=200 + ngx.send_headers）。此处不能再设置 ngx.header.*，
+    -- 否则触发 "attempt to set ngx.header.HEADER after sending out response headers"。
+    -- 流式响应也无需复制上游响应头：客户端只关心 SSE 字节流。
     local relay_ok, relay_err
     if anthropic.is_anthropic(final_provider) then
       relay_ok, relay_err = relay_anthropic_stream(stream_res, final_model, ngx.ctx.request_id)
