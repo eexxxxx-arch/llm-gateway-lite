@@ -415,6 +415,8 @@ local function is_connection_error(err)
     or lower:find('timeout', 1, true)
     or lower:find('timed out', 1, true)
     or lower:find('proxy connect', 1, true)
+    or lower == 'closed'  -- 上游/TCP 代理在等待首字节时主动关闭连接（代理 idle timeout / 上游断连）
+    or lower:find('closed by peer', 1, true)
 end
 
 -- 对 4xx/5xx 响应做结构化分析，返回给重试循环决策
@@ -683,6 +685,10 @@ local function relay_stream_response(stream_res, provider)
       return nil, chunk_err
     end
     if not chunk then
+      -- 流结束：发送 OpenAI SSE [DONE] 标记，确保客户端知道流已结束。
+      -- 部分 provider 可能在流尾不发送 [DONE]，补发一条避免客户端（如 opencode）无限等待。
+      ngx.print('data: [DONE]\n\n')
+      ngx.flush(true)
       return true
     end
 
@@ -971,6 +977,7 @@ function _M.handle(endpoint_key)
     local max_attempts = 16
     local attempt = 0
     local last_res = nil
+    local conn_retry_used = false  -- 连接错误无备选 provider 时，允许一次同 provider 重试
 
     -- 流式请求：在进入 retry 循环前提前向客户端发送 SSE 响应头与首条 ping。
     -- 目的：推理模型（glm-5.2 等）首字节延迟可达 60s+，前端（opencode）HTTP 客户端
@@ -1149,7 +1156,23 @@ function _M.handle(endpoint_key)
         { skip_current_provider = analysis.skip_same_provider }
       )
       if not next_provider then
-        break
+        -- 无备选 provider。若是连接级错误（代理/网络间歇性故障）且尚未用过重试，
+        -- 清空当前 provider 的已尝试 key 记录，允许同 provider 重试一次。
+        -- 这类错误与 key 无关（是代理/网络层面），不应阻止重用 key。
+        if not conn_retry_used and analysis.skip_same_provider and is_connection_error(req_err) then
+          conn_retry_used = true
+          attempted_keys_by_provider[provider.name] = {}
+          local retry_key = keypool.pick_key(provider, {})
+          if retry_key then
+            ngx.log(ngx.WARN, '[', format_timestamp(), '] [openai_compat] no alternative provider, retrying same provider after connection error: provider=', provider.name, ', key_id=', retry_key.id)
+            next_provider = provider
+            next_model = provider_model
+            next_key = retry_key
+          end
+        end
+        if not next_provider then
+          break
+        end
       end
 
       provider = next_provider
@@ -1192,6 +1215,9 @@ function _M.handle(endpoint_key)
           timeout_ms = final_provider.timeout_ms,
         }
         ngx.log(ngx.ERR, '[', format_timestamp(), '] [openai_compat] stream upstream request failed: ', cjson.encode(error_details))
+        -- upstream 未响应（连接失败/超时）：标记 status=0，避免 observe.lua 回退到
+        -- ngx.status（SSE preamble 的 200）导致失败请求被误计为成功
+        ngx.ctx.upstream_status = 0
         ngx.ctx.error_type = 'upstream_error'
         ngx.ctx.error_details = error_details
         emit_sse_error_chunk('upstream_error', 'upstream request failed: ' .. tostring(req_err or 'unknown error'), 502)
@@ -1275,6 +1301,7 @@ function _M.handle(endpoint_key)
   local exhausted_providers = {}
   local max_attempts = 16
   local attempt = 0
+  local conn_retry_used = false  -- 连接错误无备选 provider 时，允许一次同 provider 重试
 
   while attempt < max_attempts do
     attempt = attempt + 1
@@ -1365,7 +1392,22 @@ function _M.handle(endpoint_key)
       { skip_current_provider = analysis.skip_same_provider }
     )
     if not next_provider then
-      break
+      -- 无备选 provider。若是连接级错误（代理/网络间歇性故障）且尚未用过重试，
+      -- 清空当前 provider 的已尝试 key 记录，允许同 provider 重试一次。
+      if not conn_retry_used and analysis.skip_same_provider and is_connection_error(req_err) then
+        conn_retry_used = true
+        attempted_keys_by_provider[provider.name] = {}
+        local retry_key = keypool.pick_key(provider, {})
+        if retry_key then
+          ngx.log(ngx.WARN, '[', format_timestamp(), '] [openai_compat] no alternative provider, retrying same provider after connection error: provider=', provider.name, ', key_id=', retry_key.id)
+          next_provider = provider
+          next_model = provider_model
+          next_key = retry_key
+        end
+      end
+      if not next_provider then
+        break
+      end
     end
 
     provider = next_provider
@@ -1388,6 +1430,7 @@ function _M.handle(endpoint_key)
       timeout_ms = final_provider.timeout_ms,
     }
     ngx.log(ngx.ERR, '[', format_timestamp(), '] [openai_compat] upstream request failed: ', cjson.encode(error_details))
+    ngx.ctx.upstream_status = 0
     ngx.ctx.error_type = 'upstream_error'
     ngx.ctx.error_details = error_details
     return errors.send(502, 'upstream request failed', 'upstream_error')

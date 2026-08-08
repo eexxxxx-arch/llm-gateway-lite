@@ -9,7 +9,8 @@ local DEFAULT_SEND_TIMEOUT_MS = 30000
 local DEFAULT_READ_TIMEOUT_MS = 300000
 
 -- 代理专用超时：经 HTTP 代理时 CONNECT 隧道 + TLS 握手 + 远端首字节都需要额外时间
-local DEFAULT_PROXY_CONNECT_TIMEOUT_MS = 15000  -- 代理 CONNECT + TLS 比直连慢，给 15s
+-- TLS 握手经代理（MITM 证书拦截）可能极慢（偶见 >30s），给 45s 留余量
+local DEFAULT_PROXY_CONNECT_TIMEOUT_MS = 120000  -- 代理 CONNECT + TLS
 local DEFAULT_PROXY_READ_TIMEOUT_MS = 600000    -- 代理链路首字节延迟更高，给 10min
 
 -- 连接池默认值
