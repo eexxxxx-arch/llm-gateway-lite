@@ -204,7 +204,9 @@ local function encode_body_for_provider(body, provider)
     end
     return encoded
   end
-  return rewrite.encode_body(body)
+  -- 对请求体进行 provider 特定的格式转换（如修复 tool schema）
+  local transformed = rewrite.transform_for_provider(body, provider.name)
+  return rewrite.encode_body(transformed)
 end
 
 local function copy_response_headers(headers)
@@ -1247,9 +1249,11 @@ function _M.handle(endpoint_key)
       elseif s >= 500 then code_name = 'upstream_service_unavailable'
       end
       emit_sse_error_chunk(code_name, msg, s)
+      -- 已设置 ngx.ctx.upstream_status = last_res.status（实际错误码），不再覆盖
       return ngx.exit(200)
     end
 
+    -- 只有真正成功时才设置 upstream_status = 200
     ngx.ctx.upstream_status = 200
     ngx.ctx.error_type = nil
     -- SSE 响应头已在 ensure_sse_preamble() 中发送（Content-Type / Cache-Control / Connection /
