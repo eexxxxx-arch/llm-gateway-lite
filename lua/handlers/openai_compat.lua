@@ -303,6 +303,11 @@ local function extract_error_signal(res)
     return string.lower(res.body)
   end
 
+  -- 部分上游把错误包在数组里（如 Gemini: [{"error":{...}}]），取第一个元素
+  if type(decoded[1]) == 'table' then
+    decoded = decoded[1]
+  end
+
   local parts = {}
   local function push(v)
     if type(v) == 'string' and v ~= '' then
@@ -317,6 +322,7 @@ local function extract_error_signal(res)
   if type(decoded.error) == 'table' then
     push(decoded.error.code)
     push(decoded.error.type)
+    push(decoded.error.status)
     push(decoded.error.message)
     push(decoded.error.param)
     if type(decoded.error.metadata) == 'table' then
@@ -421,6 +427,65 @@ local function is_connection_error(err)
     or lower:find('closed by peer', 1, true)
 end
 
+local function should_cooldown_key(status, res, err)
+  if err then
+    return false
+  end
+  if not status then
+    return false
+  end
+  if status == 401 or status == 402 or status == 403 or status == 429 then
+    return true
+  end
+  if status ~= 400 then
+    return false
+  end
+
+  local signal = extract_error_signal(res)
+  if signal == '' then
+    return false
+  end
+
+  local patterns = {
+    'insufficient_quota',
+    'rate limit',
+    'too many requests',
+    'quota exceeded',
+    'exceeded your current quota',
+    'billing',
+    'credit',
+    'invalid api key',
+    'api key',
+    'authentication',
+    'unauthorized',
+    'token',
+    '限流',
+    '配额',
+    '超限',
+    '余额',
+    '欠费',
+  }
+  for _, pattern in ipairs(patterns) do
+    if signal:find(pattern, 1, true) then
+      return true
+    end
+  end
+
+  return false
+end
+
+-- Provider 级封锁（与 key 和请求内容无关）：如 Google 地区限制
+-- "User location is not supported" / FAILED_PRECONDITION —— 当前网络出口访问
+-- 该 provider 必然失败，换 key 无意义，应冷却 (provider,model) 并切换 provider
+local function is_provider_block_error(res)
+  local signal = extract_error_signal(res)
+  if signal == '' then
+    return false
+  end
+  return signal:find('user location is not supported', 1, true) ~= nil
+    or signal:find('failed_precondition', 1, true) ~= nil
+end
+
 -- 对 4xx/5xx 响应做结构化分析，返回给重试循环决策
 -- 返回: {
 --   cooldown_key: bool,              -- 是否需要冷却当前 key
@@ -446,6 +511,7 @@ local function analyze_error_for_retry(status, res, err)
         skip_same_provider = true,
         key_cooldown_sec = 10,
         pm_cooldown_sec = 30,
+        reason = 'connection_error',
       }
       return r
     end
@@ -528,6 +594,18 @@ local function analyze_error_for_retry(status, res, err)
     return r
   end
 
+  -- 400 + 地区封锁（如 Google FAILED_PRECONDITION）：请求和 key 都没问题，
+  -- 是当前网络出口访问该 provider 必然被拒 —— 冷却 (provider,model) 并切换 provider
+  if status == 400 and is_provider_block_error(res) then
+    return {
+      cooldown_key = false,
+      cooldown_provider_model = true,
+      skip_same_provider = true,
+      pm_cooldown_sec = runtime.provider_model_cooldown_sec,
+      reason = 'provider_block',
+    }
+  end
+
   -- 400 + 错误信号命中模式的：按 should_cooldown_key 的语义（由上层调用者判断）
   if status == 400 then
     if should_cooldown_key(status, res, nil) then
@@ -565,53 +643,6 @@ local function retry_backoff_sleep(attempt)
   return false
 end
 
-local function should_cooldown_key(status, res, err)
-  if err then
-    return false
-  end
-  if not status then
-    return false
-  end
-  if status == 401 or status == 402 or status == 403 or status == 429 then
-    return true
-  end
-  if status ~= 400 then
-    return false
-  end
-
-  local signal = extract_error_signal(res)
-  if signal == '' then
-    return false
-  end
-
-  local patterns = {
-    'insufficient_quota',
-    'rate limit',
-    'too many requests',
-    'quota exceeded',
-    'exceeded your current quota',
-    'billing',
-    'credit',
-    'invalid api key',
-    'api key',
-    'authentication',
-    'unauthorized',
-    'token',
-    '限流',
-    '配额',
-    '超限',
-    '余额',
-    '欠费',
-  }
-  for _, pattern in ipairs(patterns) do
-    if signal:find(pattern, 1, true) then
-      return true
-    end
-  end
-
-  return false
-end
-
 local function should_retry(res, err)
   if err then
     return true
@@ -624,7 +655,7 @@ local function should_retry(res, err)
     return true
   end
   if status == 400 then
-    return should_cooldown_key(status, res, err)
+    return should_cooldown_key(status, res, err) or is_provider_block_error(res)
   end
   if status >= 500 and status <= 599 then
     return true
@@ -1113,18 +1144,36 @@ function _M.handle(endpoint_key)
         limit_source = (extract_error_metadata(last_res) or {}).limit_source,
       }
 
-      if analysis.cooldown_key then
-        local ttl = analysis.key_cooldown_sec or runtime.key_cooldown_sec
-        keypool.mark_key_cooldown(provider, key.id, ttl, cooldown_opts)
-      elseif should_cooldown_key(last_res and last_res.status or nil, last_res, req_err) then
-        -- 兼容老逻辑兜底（400 类错误模式匹配）
-        keypool.mark_key_cooldown(provider, key.id, runtime.key_cooldown_sec, cooldown_opts)
-      end
+      -- 先探测备选 provider：没有备选时不启用冷却机制，
+      -- 避免唯一 provider 进入冷却后，后续请求在冷却窗口内全部 503。
+      -- pick_retry_target 有副作用（置 exhausted_providers），调用后直接复用结果，不再重复调用。
+      local next_provider, next_model, next_key = pick_retry_target(
+        cfg,
+        std_model,
+        endpoint_key,
+        provider,
+        provider_model,
+        attempted_keys_by_provider,
+        exhausted_providers,
+        { skip_current_provider = analysis.skip_same_provider }
+      )
 
-      if analysis.cooldown_provider_model then
-        local ttl = analysis.pm_cooldown_sec or runtime.provider_model_cooldown_sec
-        keypool.mark_provider_model_cooldown(provider.name, provider_model, ttl, cooldown_opts)
-        ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] stream cooldown (provider,model)=', provider.name, '/', provider_model, ' for ', ttl, 's; reason=', is_connection_error(req_err) and 'connection_error' or 'shared_pool_rate_limit')
+      if next_provider then
+        if analysis.cooldown_key then
+          local ttl = analysis.key_cooldown_sec or runtime.key_cooldown_sec
+          keypool.mark_key_cooldown(provider, key.id, ttl, cooldown_opts)
+        elseif should_cooldown_key(last_res and last_res.status or nil, last_res, req_err) then
+          -- 兼容老逻辑兜底（400 类错误模式匹配）
+          keypool.mark_key_cooldown(provider, key.id, runtime.key_cooldown_sec, cooldown_opts)
+        end
+
+        if analysis.cooldown_provider_model then
+          local ttl = analysis.pm_cooldown_sec or runtime.provider_model_cooldown_sec
+          keypool.mark_provider_model_cooldown(provider.name, provider_model, ttl, cooldown_opts)
+          ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] stream cooldown (provider,model)=', provider.name, '/', provider_model, ' for ', ttl, 's; reason=', analysis.reason or (is_connection_error(req_err) and 'connection_error' or 'shared_pool_rate_limit'))
+        end
+      else
+        ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] no alternative provider, skipping cooldown to keep ', provider.name, ' available')
       end
 
       -- 退避（如果是在换 provider 而不是等 key，也可以小睡一下避免打爆下游）
@@ -1147,16 +1196,6 @@ function _M.handle(endpoint_key)
 
       maybe_sse_ping(false)
 
-      local next_provider, next_model, next_key = pick_retry_target(
-        cfg,
-        std_model,
-        endpoint_key,
-        provider,
-        provider_model,
-        attempted_keys_by_provider,
-        exhausted_providers,
-        { skip_current_provider = analysis.skip_same_provider }
-      )
       if not next_provider then
         -- 无备选 provider。若是连接级错误（代理/网络间歇性故障）且尚未用过重试，
         -- 清空当前 provider 的已尝试 key 记录，允许同 provider 重试一次。
@@ -1287,9 +1326,24 @@ function _M.handle(endpoint_key)
       end
 
       if analysis.cooldown_provider_model then
-        local ttl = analysis.pm_cooldown_sec or runtime.provider_model_cooldown_sec
-        keypool.mark_provider_model_cooldown(final_provider.name, final_model, ttl, cooldown_opts)
-        ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] stream relay cooldown (provider,model)=', final_provider.name, '/', final_model, ' for ', ttl, 's; reason=', is_connection_error(relay_err) and 'connection_error' or 'relay_error')
+        -- 无备选 provider 时不冷却（与重试循环行为一致），保持唯一 provider 可用
+        local has_alt = pick_retry_target(
+          cfg,
+          std_model,
+          endpoint_key,
+          final_provider,
+          final_model,
+          attempted_keys_by_provider,
+          exhausted_providers,
+          { skip_current_provider = true }
+        ) ~= nil
+        if has_alt then
+          local ttl = analysis.pm_cooldown_sec or runtime.provider_model_cooldown_sec
+          keypool.mark_provider_model_cooldown(final_provider.name, final_model, ttl, cooldown_opts)
+          ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] stream relay cooldown (provider,model)=', final_provider.name, '/', final_model, ' for ', ttl, 's; reason=', is_connection_error(relay_err) and 'connection_error' or 'relay_error')
+        else
+          ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] no alternative provider, skipping relay-failure cooldown to keep ', final_provider.name, ' available')
+        end
       end
     end
     return ngx.exit(200)
@@ -1366,25 +1420,9 @@ function _M.handle(endpoint_key)
       limit_source = (extract_error_metadata(res) or {}).limit_source,
     }
 
-    if analysis.cooldown_key then
-      local ttl = analysis.key_cooldown_sec or runtime.key_cooldown_sec
-      keypool.mark_key_cooldown(provider, key.id, ttl, cooldown_opts)
-    elseif should_cooldown_key(res and res.status or nil, res, req_err) then
-      -- 兼容老逻辑兜底（400 类错误模式匹配）
-      keypool.mark_key_cooldown(provider, key.id, runtime.key_cooldown_sec, cooldown_opts)
-    end
-
-    if analysis.cooldown_provider_model then
-      local ttl = analysis.pm_cooldown_sec or runtime.provider_model_cooldown_sec
-      keypool.mark_provider_model_cooldown(provider.name, provider_model, ttl, cooldown_opts)
-      ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] non-stream cooldown (provider,model)=', provider.name, '/', provider_model, ' for ', ttl, 's; reason=', is_connection_error(req_err) and 'connection_error' or 'shared_pool_rate_limit')
-    end
-
-    -- 指数退避
-    if attempt >= 2 then
-      retry_backoff_sleep(attempt)
-    end
-
+    -- 先探测备选 provider：没有备选时不启用冷却机制，
+    -- 避免唯一 provider 进入冷却后，后续请求在冷却窗口内全部 503。
+    -- pick_retry_target 有副作用（置 exhausted_providers），调用后直接复用结果，不再重复调用。
     local next_provider, next_model, next_key = pick_retry_target(
       cfg,
       std_model,
@@ -1395,6 +1433,30 @@ function _M.handle(endpoint_key)
       exhausted_providers,
       { skip_current_provider = analysis.skip_same_provider }
     )
+
+    if next_provider then
+      if analysis.cooldown_key then
+        local ttl = analysis.key_cooldown_sec or runtime.key_cooldown_sec
+        keypool.mark_key_cooldown(provider, key.id, ttl, cooldown_opts)
+      elseif should_cooldown_key(res and res.status or nil, res, req_err) then
+        -- 兼容老逻辑兜底（400 类错误模式匹配）
+        keypool.mark_key_cooldown(provider, key.id, runtime.key_cooldown_sec, cooldown_opts)
+      end
+
+      if analysis.cooldown_provider_model then
+        local ttl = analysis.pm_cooldown_sec or runtime.provider_model_cooldown_sec
+        keypool.mark_provider_model_cooldown(provider.name, provider_model, ttl, cooldown_opts)
+        ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] non-stream cooldown (provider,model)=', provider.name, '/', provider_model, ' for ', ttl, 's; reason=', analysis.reason or (is_connection_error(req_err) and 'connection_error' or 'shared_pool_rate_limit'))
+      end
+    else
+      ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] no alternative provider, skipping cooldown to keep ', provider.name, ' available')
+    end
+
+    -- 指数退避
+    if attempt >= 2 then
+      retry_backoff_sleep(attempt)
+    end
+
     if not next_provider then
       -- 无备选 provider。若是连接级错误（代理/网络间歇性故障）且尚未用过重试，
       -- 清空当前 provider 的已尝试 key 记录，允许同 provider 重试一次。

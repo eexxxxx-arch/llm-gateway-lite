@@ -34,6 +34,7 @@ function _M.mark_key_cooldown(provider, key_id, ttl, opts)
 end
 
 -- provider-model 组合级别冷却：用于共享池限流（同 provider 所有 key 换了都没用的场景）
+-- 冷却值存储过期时间戳（而非 true），支持"冷却队列"查询（找最早过期的组合提前激活）
 function _M.is_provider_model_available(provider_name, provider_model)
   if not state then
     return true
@@ -42,7 +43,15 @@ function _M.is_provider_model_available(provider_name, provider_model)
     return true
   end
   local value = state:get(cooldown_provider_model(provider_name, provider_model))
-  return value == nil
+  if value == nil then
+    return true
+  end
+  if type(value) == 'number' then
+    -- 时间戳格式：已到过期时间即视为可用（正常情况 TTL 到期后 dict 会自动清除）
+    return value <= ngx.now()
+  end
+  -- 旧格式（boolean true）：按冷却中处理
+  return false
 end
 
 function _M.mark_provider_model_cooldown(provider_name, provider_model, ttl, opts)
@@ -52,7 +61,7 @@ function _M.mark_provider_model_cooldown(provider_name, provider_model, ttl, opt
   if not provider_name or not provider_model then
     return
   end
-  state:set(cooldown_provider_model(provider_name, provider_model), true, ttl)
+  state:set(cooldown_provider_model(provider_name, provider_model), ngx.now() + (tonumber(ttl) or 0), ttl)
   if opts == nil then
     opts = {}
   end
@@ -63,6 +72,51 @@ function _M.mark_provider_model_cooldown(provider_name, provider_model, ttl, opt
       stats.record_key_cooldown(provider_name, 'model:' .. tostring(provider_model), ttl, opts)
     end
   end)
+end
+
+-- 列出所有冷却中的 (provider,model)，按过期时间升序（= 冷却队列，队首最早过期）
+-- exclude: 可选，{ [provider_name] = true } 排除集合
+function _M.list_provider_model_cooldowns(exclude)
+  local result = {}
+  if not state then
+    return result
+  end
+  local now = ngx.now()
+  local keys = state:get_keys(1024)
+  if not keys then
+    return result
+  end
+  for _, k in ipairs(keys) do
+    if type(k) == 'string' and k:sub(1, 12) == 'cooldown_pm:' then
+      local rest = k:sub(13)
+      local sep = rest:find(':', 1, true)
+      if sep then
+        local provider_name = rest:sub(1, sep - 1)
+        local provider_model = rest:sub(sep + 1)
+        local exp = tonumber(state:get(k))
+        if exp and not (exclude and exclude[provider_name]) then
+          table.insert(result, {
+            provider_name = provider_name,
+            provider_model = provider_model,
+            expire_at = exp,
+            remaining = exp - now,
+          })
+        end
+      end
+    end
+  end
+  table.sort(result, function(a, b)
+    return a.expire_at < b.expire_at
+  end)
+  return result
+end
+
+-- 解除指定 (provider,model) 的冷却（提前激活）
+function _M.clear_provider_model_cooldown(provider_name, provider_model)
+  if not state or not provider_name or not provider_model then
+    return
+  end
+  state:delete(cooldown_provider_model(provider_name, provider_model))
 end
 
 function _M.pick_key(provider, opts)

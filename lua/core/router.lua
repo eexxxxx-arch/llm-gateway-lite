@@ -25,6 +25,13 @@ local function allow_provider(model_policy, provider_name)
   return model_policy.allow_set[provider_name] == true
 end
 
+local function format_timestamp()
+  local now = ngx.now()
+  local sec = math.floor(now)
+  local msec = math.floor((now - sec) * 1000)
+  return os.date('%Y-%m-%d %H:%M:%S', sec) .. string.format('.%03d', msec)
+end
+
 -- 检查 (provider_name, provider_model) 组合是否未被冷却
 local function provider_model_ready(provider_name, provider_model)
   return keypool.is_provider_model_available(provider_name, provider_model)
@@ -140,6 +147,28 @@ function _M.select_provider_with_key(config, std_model, opts)
   end
 
   if #candidates == 0 then
+    -- 兜底2：所有 (provider,model) 均在冷却中 → 激活冷却队列队首（最早过期的组合），
+    -- 让请求仍能尝试而不是直接 503。被本次请求排除（exclude）的组合不参与激活；
+    -- 激活的组合必须属于本模型的 provider_map，避免为其他模型误激活。
+    local queue = keypool.list_provider_model_cooldowns(exclude)
+    for _, item in ipairs(queue) do
+      local provider = config.providers[item.provider_name]
+      if provider
+        and model.provider_map
+        and model.provider_map[item.provider_name] == item.provider_model
+        and allow_provider(model.policy, item.provider_name)
+        and keypool.has_available_key(provider)
+      then
+        local act_key = keypool.pick_key(provider, {
+          exclude_key_ids = opts and opts.exclude_key_ids_by_provider and opts.exclude_key_ids_by_provider[item.provider_name] or nil
+        })
+        if act_key then
+          keypool.clear_provider_model_cooldown(item.provider_name, item.provider_model)
+          ngx.log(ngx.INFO, '[', format_timestamp(), '] [router] all (provider,model) candidates cooling down; activated soonest cooldown: ', item.provider_name, '/', tostring(item.provider_model), ' (remaining ', math.max(0, math.floor(item.remaining)), 's)')
+          return provider, item.provider_model, act_key, nil
+        end
+      end
+    end
     return nil, nil, nil, 'no_provider_available'
   end
 

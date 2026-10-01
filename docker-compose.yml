@@ -15,35 +15,16 @@ services:
       - GATEWAY_AUTH_ENABLED=true  # 是否启用客户端鉴权
       - GATEWAY_ADMIN_TOKEN=${GATEWAY_ADMIN_TOKEN:-change-me-admin-token}
       - GATEWAY_KEY_COOLDOWN_SEC=120  # Key 超限/鉴权失败冷却 2 分钟
+      # HTTP 代理地址（统一配置在此，nginx 声明 env，Lua 通过 os.getenv 读取）
+      # providers.yaml 中用 proxy_url_env: HTTP_PROXY_URL 引用，无需硬编码
+      - HTTP_PROXY_URL=${HTTP_PROXY_URL:-http://127.0.0.1:7897}
     volumes:
       - ./configs:/etc/llm-gateway/conf.d
       - ./logs:/var/log/llm-gateway
       - ./docker/entrypoint.sh:/app/entrypoint.sh:ro
       - ./nginx/nginx.conf:/app/nginx/nginx.conf:ro
       - ./nginx/conf.d/gateway.conf:/app/nginx/conf.d/gateway.conf:ro
-      - ./lua/init.lua:/app/lua/init.lua:ro
-      - ./lua/config/yaml.lua:/app/lua/config/yaml.lua:ro
-      - ./lua/config/loader.lua:/app/lua/config/loader.lua:ro
-      - ./lua/config/runtime.lua:/app/lua/config/runtime.lua:ro
-      - ./lua/core/auth.lua:/app/lua/core/auth.lua:ro
-      - ./lua/core/http_client.lua:/app/lua/core/http_client.lua:ro
-      - ./lua/core/observe.lua:/app/lua/core/observe.lua:ro
-      - ./lua/core/router.lua:/app/lua/core/router.lua:ro
-      - ./lua/core/keypool.lua:/app/lua/core/keypool.lua:ro
-      - ./lua/core/stats.lua:/app/lua/core/stats.lua:ro
-      - ./lua/core/admin_auth.lua:/app/lua/core/admin_auth.lua:ro
-      - ./lua/core/config_manager.lua:/app/lua/core/config_manager.lua:ro
-      - ./lua/core/gemini_signature.lua:/app/lua/core/gemini_signature.lua:ro
-      - ./lua/handlers/openai_compat.lua:/app/lua/handlers/openai_compat.lua:ro
-      - ./lua/handlers/models.lua:/app/lua/handlers/models.lua:ro
-      - ./lua/handlers/log.lua:/app/lua/handlers/log.lua:ro
-      - ./lua/handlers/admin_stats.lua:/app/lua/handlers/admin_stats.lua:ro
-      - ./lua/handlers/admin_dashboard.lua:/app/lua/handlers/admin_dashboard.lua:ro
-      - ./lua/handlers/admin_catalog.lua:/app/lua/handlers/admin_catalog.lua:ro
-      - ./lua/handlers/admin_topology.lua:/app/lua/handlers/admin_topology.lua:ro
-      - ./lua/handlers/admin_config_api.lua:/app/lua/handlers/admin_config_api.lua:ro
-      - ./lua/handlers/admin_config_page.lua:/app/lua/handlers/admin_config_page.lua:ro
-      - ./lua/handlers/admin_login.lua:/app/lua/handlers/admin_login.lua:ro
+      - ./lua:/app/lua:ro  # 挂载整个 lua 目录，避免逐文件挂载遗漏（如 rewrite.lua）导致容器运行旧代码
     restart: unless-stopped
     logging:
       driver: "json-file"

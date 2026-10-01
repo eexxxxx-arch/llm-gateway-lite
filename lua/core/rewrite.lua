@@ -17,7 +17,7 @@ local function fix_tool_schema(tool)
     return tool
   end
 
-  local func = tool.function or tool
+  local func = tool["function"] or tool
   if type(func) ~= 'table' then
     return tool
   end
@@ -28,7 +28,9 @@ local function fix_tool_schema(tool)
   end
 
   -- 修复 required 字段：如果是空对象 {} 改为空数组 []
-  if params.required ~= nil and type(params.required) ~= 'array' then
+  -- 注意：Lua 的 type() 没有 'array'，JSON 数组在 Lua 中也是 table，
+  -- 统一设置 array_mt，cjson 会将其编码为数组（非空数组不受影响）
+  if type(params.required) == 'table' then
     -- 设置元表使 cjson 编码为空数组 []
     setmetatable(params.required, require('cjson').array_mt)
   end
@@ -38,7 +40,7 @@ local function fix_tool_schema(tool)
     if type(obj) ~= 'table' then
       return
     end
-    if obj.required ~= nil and type(obj.required) ~= 'array' then
+    if type(obj.required) == 'table' then
       setmetatable(obj.required, require('cjson').array_mt)
     end
     -- 递归处理 properties
@@ -73,7 +75,7 @@ local function deep_copy(obj)
   return copy
 end
 
--- 转换请求体以兼容特定 provider
+-- 转换请求体以兼容 provider
 function _M.transform_for_provider(body, provider_name)
   if type(body) ~= 'table' then
     return body
@@ -82,26 +84,21 @@ function _M.transform_for_provider(body, provider_name)
   -- 深拷贝避免污染原始请求
   local transformed = deep_copy(body)
 
-  -- Gemini: 修复可能的格式问题
-  if provider_name and provider_name:find('gemini', 1, true) then
-    -- 修复 tools 中的 schema
-    if type(transformed.tools) == 'table' then
-      for i, tool in ipairs(transformed.tools) do
-        transformed.tools[i] = fix_tool_schema(tool)
-      end
+  -- 通用：修复所有 provider 的工具参数 schema
+  -- 客户端可能发送 required:{}（空对象），严格校验的上游会报
+  -- "invalid 'parameters' schema: {} is not of type 'array'"，统一修正为 []
+  -- 注意：不能用 find(name, 1, true) 匹配 'agnes%-ai' —— plain 模式下
+  -- '%-' 是字面字符，永远匹配不到 'agnes-ai'（此前 agnes 修复不生效的根因）
+  if type(transformed.tools) == 'table' then
+    for i, tool in ipairs(transformed.tools) do
+      transformed.tools[i] = fix_tool_schema(tool)
     end
-    -- 移除可能不被支持或导致格式问题的字段
-    transformed.parallel_tool_calls = nil
-    transformed.service_tier = nil
   end
 
-  -- Agnes: 修复工具参数 schema
-  if provider_name and (provider_name:find('agnes%-ai', 1, true) or provider_name:find('agnes%-cn', 1, true)) then
-    if type(transformed.tools) == 'table' then
-      for i, tool in ipairs(transformed.tools) do
-        transformed.tools[i] = fix_tool_schema(tool)
-      end
-    end
+  -- Gemini: 移除可能不被支持或导致格式问题的字段
+  if provider_name and provider_name:find('gemini', 1, true) then
+    transformed.parallel_tool_calls = nil
+    transformed.service_tier = nil
   end
 
   return transformed
