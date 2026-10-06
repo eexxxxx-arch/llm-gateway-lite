@@ -115,6 +115,12 @@ function _M.new_stream_state()
   return { index_to_id = {} }
 end
 
+-- 公开缓存读写接口：供 gemini_adapter（原生协议）按合成 tool_call_id 捕获/回注
+-- 原生协议下签名位于 parts[].thoughtSignature，无 extra_content 包装，
+-- 捕获时机在 translate_response / 流式 translator 内部，复用同一 shared dict 与 TTL。
+_M.cache_signature = cache_signature
+_M.get_cached_signature = get_cached_signature
+
 -- 将缓存的签名回注到请求体的 messages 中
 -- 返回: 注入的签名数量
 function _M.inject_into_body(body)

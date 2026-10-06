@@ -9,6 +9,7 @@ local observe = require('core.observe')
 local http_client = require('core.http_client')
 local auth = require('core.auth')
 local anthropic = require('core.anthropic_adapter')
+local gemini = require('core.gemini_adapter')
 local gemini_sig = require('core.gemini_signature')
 
 local _M = {}
@@ -178,6 +179,12 @@ local function build_headers(provider, key, request_id)
     for name, value in pairs(auth_headers) do
       headers[name] = value
     end
+  elseif gemini.is_gemini(provider) then
+    -- Gemini 原生 API 使用 x-goog-api-key 头部
+    local auth_headers = gemini.build_auth_headers(provider, key)
+    for name, value in pairs(auth_headers) do
+      headers[name] = value
+    end
   else
     local auth = provider.auth or {}
     local header_name = auth.header or 'Authorization'
@@ -204,9 +211,35 @@ local function encode_body_for_provider(body, provider)
     end
     return encoded
   end
+  if gemini.is_gemini(provider) then
+    -- 先做通用 provider 特定转换（修复 tool schema / 移除不支持字段），
+    -- 再翻译为 Gemini 原生 GenerateContent 格式
+    local transformed = rewrite.transform_for_provider(body, provider.name)
+    local translated = gemini.translate_request(transformed, provider)
+    local encoded, err = cjson.encode(translated)
+    if not encoded then
+      return nil, err or 'failed to encode gemini body'
+    end
+    return encoded
+  end
   -- 对请求体进行 provider 特定的格式转换（如修复 tool schema）
   local transformed = rewrite.transform_for_provider(body, provider.name)
   return rewrite.encode_body(transformed)
+end
+
+-- 构造上游 URL：
+--   Gemini 原生：model 在 path 中（/models/{model}:generateContent），
+--               且不透传客户端 query args（避免覆盖 alt=sse）
+--   其他：       join_url(base_url, endpoint) + 透传客户端 args
+local function build_upstream_url(provider, provider_model, endpoint, is_stream)
+  if gemini.is_gemini(provider) then
+    return gemini.build_url(provider, provider_model, is_stream)
+  end
+  local url = join_url(provider.base_url, endpoint)
+  if ngx.var.args and ngx.var.args ~= '' then
+    url = url .. '?' .. ngx.var.args
+  end
+  return url
 end
 
 local function copy_response_headers(headers)
@@ -663,11 +696,8 @@ local function should_retry(res, err)
   return false
 end
 
-local function do_request(provider, key, endpoint, body_json, request_id)
-  local url = join_url(provider.base_url, endpoint)
-  if ngx.var.args and ngx.var.args ~= '' then
-    url = url .. '?' .. ngx.var.args
-  end
+local function do_request(provider, key, endpoint, body_json, request_id, provider_model)
+  local url = build_upstream_url(provider, provider_model, endpoint, false)
   local headers = build_headers(provider, key, request_id)
   return http_client.request({
     url = url,
@@ -879,6 +909,126 @@ local function relay_anthropic_stream(stream_res, provider_model, request_id)
   end
 end
 
+-- 解析 Gemini SSE 流并转写成 OpenAI Chat Completion 的 SSE chunk。
+-- 与 Anthropic 的差异：Gemini SSE 只有 data 行（无 event: 行），
+-- 每个 data 是一个完整的 GenerateContentResponse，且流尾无 [DONE]（由网关补发）。
+-- 输入是 stream_res（http_client.request_stream 的返回值），输出通过 ngx.print/ngx.flush 发送。
+local function relay_gemini_stream(stream_res, provider_model, request_id)
+  if not stream_res then
+    return nil, 'missing stream response'
+  end
+
+  local translator = gemini.new_stream_translator(provider_model, request_id)
+  local buffer = ''
+  -- 累积待发送的字符串
+  local pending = {}
+
+  local function flush_pending()
+    if #pending == 0 then
+      return true
+    end
+    local data = table.concat(pending)
+    pending = {}
+    local ok, print_err = ngx.print(data)
+    if not ok then
+      return nil, print_err or 'failed to write gemini stream'
+    end
+    local ok_flush, flush_err = ngx.flush(true)
+    if not ok_flush then
+      return nil, flush_err or 'failed to flush gemini stream'
+    end
+    return true
+  end
+
+  local function emit(payload)
+    if payload and payload ~= '' then
+      table.insert(pending, 'data: ' .. payload .. '\n\n')
+    end
+  end
+
+  local function handle_data(data_str)
+    local data = cjson.decode(data_str)
+    if type(data) ~= 'table' then
+      return
+    end
+    emit(translator.handle_data(data))
+  end
+
+  -- 处理 buffer 中已完整的事件块（以空行分隔）
+  local function process_buffer()
+    while true do
+      local start_idx, end_idx = buffer:find('\r?\n\r?\n', 1)
+      if not start_idx then
+        break
+      end
+      local block = buffer:sub(1, start_idx - 1)
+      buffer = buffer:sub(end_idx + 1)
+
+      local data_lines = {}
+      for line in block:gmatch('[^\r\n]+') do
+        local prefix, rest = line:match('^(%a+):%s*(.*)$')
+        if prefix == 'data' then
+          table.insert(data_lines, rest)
+        end
+      end
+      -- SSE 规范：多行 data 以换行拼接后作为一个事件
+      if #data_lines > 0 then
+        handle_data(table.concat(data_lines, '\n'))
+      end
+    end
+  end
+
+  -- 同 relay_stream_response：Gemini 中继也需要空闲时向客户端送 SSE 注释 ping
+  local GEMINI_PING_INTERVAL_S = 15
+  local last_client_tx_at_g = ngx.now()
+  local function emit_gemini_ping_if_idle(force)
+    local now = ngx.now()
+    if force or (now - last_client_tx_at_g) >= GEMINI_PING_INTERVAL_S then
+      local ok, _ = ngx.print(': ping (stream is still active, waiting for next token)\n\n')
+      if ok then ngx.flush(true) end
+      last_client_tx_at_g = now
+    end
+  end
+  -- 包装 flush_pending：每次成功 flush 后更新最后发送时间
+  local orig_flush_pending_g = flush_pending
+  local function tracked_flush_pending()
+    local ok = orig_flush_pending_g()
+    if ok then last_client_tx_at_g = ngx.now() end
+    return ok
+  end
+
+  while true do
+    emit_gemini_ping_if_idle(false)
+    local chunk, chunk_err = stream_res.read_chunk()
+    if chunk_err then
+      emit_gemini_ping_if_idle(true)
+      return nil, chunk_err
+    end
+    if not chunk then
+      -- 流结束，处理剩余 buffer
+      if buffer ~= '' then
+        if not buffer:find('\r?\n\r?\n$', 1) then
+          buffer = buffer .. '\n\n'
+        end
+        process_buffer()
+      end
+      -- Gemini 不发送 [DONE]，网关补发（OpenAI SSE 流末尾标记）
+      table.insert(pending, 'data: [DONE]\n\n')
+      local ok_flush = tracked_flush_pending()
+      if not ok_flush then
+        return nil, 'failed to flush final gemini stream'
+      end
+      return true
+    end
+    buffer = buffer .. chunk
+    process_buffer()
+    local ok_flush = tracked_flush_pending()
+    if not ok_flush then
+      return nil, 'failed to flush gemini stream chunk'
+    end
+  end
+end
+
 -- opts.skip_current_provider: 为 true 时不尝试当前 provider 的其他 key，直接切换 provider
 local function pick_retry_target(cfg, std_model, endpoint_key, current_provider, current_model, attempted_keys_by_provider, exhausted_providers, opts)
   opts = opts or {}
@@ -1071,8 +1221,9 @@ function _M.handle(endpoint_key)
       local attempt_body = deep_copy(body)
       apply_provider_request_defaults(attempt_body, provider)
       attempt_body.model = provider_model
-      -- Gemini: 从缓存回注 thought_signature，防止 400 missing thought_signature
-      if gemini_sig.is_gemini_provider(provider) then
+      -- Gemini OpenAI 兼容端点：从缓存回注 thought_signature，防止 400 missing thought_signature
+      -- （原生协议 type=gemini 的回注在 gemini_adapter.translate_request 内完成，跳过）
+      if gemini_sig.is_gemini_provider(provider) and not gemini.is_gemini(provider) then
         gemini_sig.inject_into_body(attempt_body)
       end
       local encoded, body_err = encode_body_for_provider(attempt_body, provider)
@@ -1087,7 +1238,7 @@ function _M.handle(endpoint_key)
       end
       body_json = encoded
 
-      local url = join_url(provider.base_url, final_endpoint)
+      local url = build_upstream_url(provider, provider_model, final_endpoint, true)
       local request_headers = build_headers(provider, key, ngx.ctx.request_id)
       log_upstream_request(provider, url, request_headers, body_json)
 
@@ -1302,6 +1453,8 @@ function _M.handle(endpoint_key)
     local relay_ok, relay_err
     if anthropic.is_anthropic(final_provider) then
       relay_ok, relay_err = relay_anthropic_stream(stream_res, final_model, ngx.ctx.request_id)
+    elseif gemini.is_gemini(final_provider) then
+      relay_ok, relay_err = relay_gemini_stream(stream_res, final_model, ngx.ctx.request_id)
     else
       relay_ok, relay_err = relay_stream_response(stream_res, final_provider)
     end
@@ -1379,8 +1532,9 @@ function _M.handle(endpoint_key)
     local attempt_body = deep_copy(body)
     apply_provider_request_defaults(attempt_body, provider)
     attempt_body.model = provider_model
-    -- Gemini: 从缓存回注 thought_signature，防止 400 missing thought_signature
-    if gemini_sig.is_gemini_provider(provider) then
+    -- Gemini OpenAI 兼容端点：从缓存回注 thought_signature，防止 400 missing thought_signature
+    -- （原生协议 type=gemini 的回注在 gemini_adapter.translate_request 内完成，跳过）
+    if gemini_sig.is_gemini_provider(provider) and not gemini.is_gemini(provider) then
       gemini_sig.inject_into_body(attempt_body)
     end
     local encoded, body_err = encode_body_for_provider(attempt_body, provider)
@@ -1390,7 +1544,7 @@ function _M.handle(endpoint_key)
     end
     body_json = encoded
 
-    local url = join_url(provider.base_url, final_endpoint)
+    local url = build_upstream_url(provider, provider_model, final_endpoint, false)
     local request_headers = build_headers(provider, key, ngx.ctx.request_id)
 
     if attempt == 1 then
@@ -1399,7 +1553,7 @@ function _M.handle(endpoint_key)
       ngx.log(ngx.INFO, '[', format_timestamp(), '] [openai_compat] retrying with provider=', provider.name, ', url=', url, ', key_id=', key.id, ', attempt=', attempt)
     end
     log_upstream_request(provider, url, request_headers, body_json)
-    res, req_err = do_request(provider, key, final_endpoint, body_json, ngx.ctx.request_id)
+    res, req_err = do_request(provider, key, final_endpoint, body_json, ngx.ctx.request_id, provider_model)
 
     if not res and req_err then
       log_failed_request(provider, url, request_headers, body_json, nil, req_err)
@@ -1514,6 +1668,12 @@ function _M.handle(endpoint_key)
       ngx.say(anthropic.translate_response(res.body or '', final_model, final_provider.name))
     else
       ngx.say(anthropic.translate_error_response(res.body or ''))
+    end
+  elseif gemini.is_gemini(final_provider) then
+    if res.status == 200 then
+      ngx.say(gemini.translate_response(res.body or '', final_model, final_provider.name))
+    else
+      ngx.say(gemini.translate_error_response(res.body or ''))
     end
   else
     -- Gemini: 非流式 200 响应中捕获 thought_signature，供后续请求回注
